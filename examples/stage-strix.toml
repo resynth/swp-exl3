@@ -1,0 +1,14 @@
+# Strix Halo (Ubuntu Server 26.04, Kyojin 1.6.0, ROCm). EXAMPLE VALUES: take layers from `swp-plan`.
+# HIP presents as "cuda:0" in torch.
+[stage]
+node = "strix"
+listen = "0.0.0.0:7802"
+secret_env = "SWP_SECRET"            # export SWP_SECRET=... on every machine (or insecure = true on a direct cable)
+model_dir = "/models/GLM-5.3-Flash-exl3"     # full model dir, or a slice dir made by `swp-exl3 pull`
+layers = [20, 44]                    # [first, end): must equal the pipeline file; 44 is a guess, read num_hidden_layers
+embed = false
+head = true                          # the last stage also holds hc_head, final norm and lm_head
+device = "cuda:0"
+cache_tokens = 16384                 # KV/state cache, multiple of 256
+max_chunk = 512                      # rows per FORWARD (boundary row = hc_mult*hidden*4 bytes = 64 KiB at f32 for GLM-5.3)
+wire_dtypes = ["f32", "bf16"]

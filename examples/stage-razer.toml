@@ -1,0 +1,18 @@
+# Razer (Ubuntu 24.04, upstream exllamav3 1.6.4, CUDA, 16 GB VRAM + 64 GB RAM). EXAMPLE VALUES.
+[stage]
+node = "razer"
+listen = "0.0.0.0:7801"
+secret_env = "SWP_SECRET"
+model_dir = "/models/glm53-razer-slice"      # produced by: swp-exl3 pull --server strix:7700 ... --first
+layers = [0, 20]
+embed = true
+head = false
+device = "cuda:0"
+cache_tokens = 16384
+max_chunk = 512
+wire_dtypes = ["f32", "bf16"]
+
+# Set on config.infer_params before the model is built (upstream 1.6.x CPU expert offload).
+# Use ONE of: moe_cpu_offload = N MoE layers fully on CPU, or moe_cpu_split = N experts per layer on CPU.
+[stage.engine]
+moe_cpu_offload = 10

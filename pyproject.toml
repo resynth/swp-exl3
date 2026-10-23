@@ -1,0 +1,12 @@
+[project]
+name = "swp-exl3"
+version = "0.1.0"
+description = "SWP/1 pipeline-split adapter for exllamav3 / Kyojin (stage server + coordinator)"
+requires-python = ">=3.11"
+dependencies = ["numpy", "blake3"]
+
+[project.scripts]
+swp-exl3 = "swp_exl3.cli:main"
+
+[tool.setuptools]
+packages = ["swp_exl3"]

@@ -1,0 +1,15 @@
+# Coordinator (runs next to the Strix stage). Stages in pipeline order; ranges must be contiguous from 0.
+[pipeline]
+model_dir = "/models/GLM-5.3-Flash-exl3"     # for tokenizer + contract check; optional
+secret_env = "SWP_SECRET"
+wire_dtype = "f32"                   # "bf16" halves bytes; decide after a logits KL comparison
+chunk = 512
+topk = 64
+
+[[stage]]
+addr = "razer-tb:7801"               # the Thunderbolt-network address of the Razer
+layers = [0, 20]
+
+[[stage]]
+addr = "127.0.0.1:7802"
+layers = [20, 44]
