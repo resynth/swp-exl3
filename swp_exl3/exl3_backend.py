@@ -49,6 +49,11 @@ class Exl3Backend(Backend):
             os.environ[k] = str(v)
         os.environ.setdefault("EXL3_PF_HC_FUSE", "0")
         os.environ.setdefault("EXL3_PF_GR_FUSE", "0")
+        # On ROCm, torch's profiler registration leaves the HSA runtime event thread spinning on a full core for
+        # the life of the process (from the first device op on). exllamav3 sets this before importing torch, but
+        # this adapter imports torch first (just below), so the setdefault in exllamav3/__init__.py runs too late.
+        # Mirror it here so the flag is in place before torch loads.
+        os.environ.setdefault("ROCPROFILER_REGISTER_ENABLED", "0")
         import torch
         from exllamav3 import Config, Model, Cache
         self.torch, self.cfg, self.log = torch, cfg, log
@@ -126,6 +131,13 @@ class Exl3Backend(Backend):
             self.torch.cuda.synchronize()
 
     def forward(self, start_pos, token_ids, hidden, wire_dtype, want, return_rows, k):
+        # The engine's own Model.forward() is @torch.inference_mode, but forward_ls() is not. The cache and the
+        # recurrent state do in-place updates on inference tensors, which raises "Inplace update to inference
+        # tensor outside InferenceMode" unless the whole pass runs inside it.
+        with self.torch.inference_mode():
+            return self._forward_impl(start_pos, token_ids, hidden, wire_dtype, want, return_rows, k)
+
+    def _forward_impl(self, start_pos, token_ids, hidden, wire_dtype, want, return_rows, k):
         t = self.torch
         m, n = self.model, len(token_ids)
         t0 = time.perf_counter()
@@ -139,8 +151,10 @@ class Exl3Backend(Backend):
         if self.has_head:
             params["last_tokens_only"] = n if (want != "none" and return_rows == "all") else 1
         x = m.prepare_inputs(ids, params)
+        t_prep = time.perf_counter()
         for pm in getattr(m, "_get_prefetch_layers", []):
             pm.prefetch(x, params)
+        t_pf = time.perf_counter()
         if hidden is not None:
             if wire_dtype == "bf16":
                 x = t.frombuffer(hidden, dtype=t.int16).view(t.bfloat16).float()
@@ -149,14 +163,21 @@ class Exl3Backend(Backend):
             x = x.reshape((1, n) + self.tail)
         t1 = time.perf_counter()
         y = m.forward_ls(x, params)
+        t_fwd = time.perf_counter()
         if not self.has_head:
             y = flush_hyperconnections(params, y)
+        t_flush = time.perf_counter()
         from exllamav3.cache.recurrent_util import advance_recurrent_states
         advance_recurrent_states(ids, params, m)
         self._sync()
         t2 = time.perf_counter()
         self.pos = start_pos + n
-        timing = {"h2d_ms": (t1 - t0) * 1e3, "compute_ms": (t2 - t1) * 1e3}
+        timing = {"h2d_ms": (t1 - t0) * 1e3, "compute_ms": (t2 - t1) * 1e3,
+                  "prepare_ms": (t_prep - t0) * 1e3, "prefetch_ms": (t_pf - t_prep) * 1e3,
+                  "forward_ls_ms": (t_fwd - t1) * 1e3, "flush_ms": (t_flush - t_fwd) * 1e3,
+                  "advance_ms": (t2 - t_flush) * 1e3}
+        if os.environ.get("SWP_DEBUG_TIMING"):
+            self.log(f"[timing] n={n} " + " ".join(f"{kk}={vv:.1f}" for kk, vv in timing.items()))
 
         if not self.has_head:
             if tuple(y.shape) != (1, n) + self.tail:
