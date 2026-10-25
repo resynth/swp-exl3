@@ -1,6 +1,6 @@
 """`swp-exl3 doctor`: verify, on THIS machine's installed exllamav3, every engine API the adapter relies on, and
 optionally dry-run the slice (build the model structure, no weights) for a layer range."""
-import importlib, inspect, sys
+import importlib, importlib.util, inspect, sys
 
 OK, WARN, FAIL = "ok  ", "WARN", "FAIL"
 
@@ -46,9 +46,18 @@ def run(model_dir=None, layers=None, first=False, last=False, out=print):
     flush = "hc_flush" if hasattr(hc, "hc_flush") else ("HyperConnection.flush_pending" if hasattr(getattr(hc, "HyperConnection", None), "flush_pending") else None)
     check("hyper-connection flush helper", lambda: flush or False)
     check("architecture Glm5NextModel (GLM-5.3-Flash)", lambda: hasattr(importlib.import_module("exllamav3.architecture.glm5_next"), "Glm5NextModel"))
-    variant = "upstream-style (CPU expert offload present)" if hasattr(importlib.import_module("exllamav3"), "__file__") and \
-        importlib.util.find_spec("exllamav3.modules.moe_cpu_host") else "no moe_cpu_host module (kyojin-style / older)"
-    out(f"[info] {variant}")
+    knobs = ("moe_cpu_offload", "moe_cpu_split", "moe_cpu_threads", "moe_cpu_pinned_arena",
+             "draft_moe_cpu_offload", "draft_moe_cpu_threads")
+    if importlib.util.find_spec("exllamav3.modules.block_sparse_mlp_cpu"):
+        def offload_info():
+            ip = importlib.import_module("exllamav3.model.config").InferParams()
+            have = [k for k in knobs if hasattr(ip, k)]
+            if not have:
+                return False
+            return "defaults: " + ", ".join(f"{k}={getattr(ip, k)!r}" for k in have)
+        check("CPU expert offload (modules.block_sparse_mlp_cpu)", offload_info)
+    else:
+        warn("CPU expert offload", "no exllamav3.modules.block_sparse_mlp_cpu in this engine (offload unavailable)")
 
     if model_dir:
         from .contract import contract_from_config

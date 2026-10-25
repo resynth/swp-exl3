@@ -1,5 +1,9 @@
 """SWP/1 transport: framing, handshake (client and server), RPC helpers. Pure stdlib + `blake3` (auth/hash only).
-Wire format: see the SWP/1 spec doc, section A3. Interoperates with the Rust reference tools (splitwire)."""
+Wire format: see the SWP/1 spec doc, section A3. Interoperates with the Rust reference tools (splitwire).
+
+Canonical copy: `splitwire/python/swp.py`. This file is vendored verbatim into `swp_exl3/swp.py` so the
+adapter stays installable on its own; edit the canonical copy in splitwire and re-copy, and
+`tests/test_swp_sync.py` fails if the two diverge."""
 import json, os, socket, struct
 
 MAGIC = b"SWP1"
@@ -144,3 +148,33 @@ class Peer:
             self.sock.close()
         except OSError:
             pass
+
+
+class StageClient:
+    """Client with the stage RPCs (configure/forward/truncate/close); kept for the splitwire tools."""
+
+    def __init__(self, addr, node="py-client", secret=None, caps=("coordinator",), timeout=None):
+        host, port = addr.rsplit(":", 1)
+        self.addr = addr
+        self.sock = socket.create_connection((host, int(port)), timeout=timeout)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.seq = 10
+        self.server = client_handshake(self.sock, node, caps, secret)
+
+    def _rpc(self, kind, header, payload=b"", want=None):
+        self.seq += 1
+        send_frame(self.sock, kind, self.seq, header, payload)
+        return expect(recv_frame(self.sock), want)
+
+    def configure(self, session, layers, has_embed, has_head, model, wire_dtype="f32"):
+        return self._rpc(STAGE_CONFIGURE, {"session": session, "layers": list(layers), "has_embed": has_embed,
+                                           "has_head": has_head, "wire_dtype": wire_dtype, "model": model}, want=STAGE_READY)[0]
+
+    def forward(self, header, payload=b""):
+        return self._rpc(FORWARD, header, payload, want=FORWARD_OUT)
+
+    def truncate(self, session, pos):
+        return self._rpc(CACHE_OP, {"session": session, "op": "truncate", "pos": pos}, want=CACHE_OK)[0]
+
+    def close(self, session):
+        return self._rpc(SESSION_CLOSE, {"session": session}, want=SESSION_CLOSED)[0]
