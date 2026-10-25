@@ -253,6 +253,81 @@ overhead is ~2.0 ms/token. `STRIX-IDLE-WAKE.md` covers the options, costs and ve
 The final smoke (local stage 0, Strix back in its slow state) measured 15.47 tok/s with stage 0
 0.36 ms and stage 1 3.04 ms, showing the same bimodality.
 
+## Step S1 — protocol + speculative loop on the fake backend
+
+**Protocol (splitwire first).** SWP/1 gains the additive, capability-gated `spec` path: stages advertise
+`spec` in HELLO and `spec_k` in STAGE_READY; FORWARD accepts `mode:"verify"`, `draft_ids`, `accept`,
+`sampling`, `next_drafts`; the head may answer `kind:"spec"` with `accepted`, `tokens` (int32 payload),
+`drafts`, `timing`. The "rewind only immediately after a verify forward" rule and the lazy-rewind
+contract are documented in `splitwire/README.md` and the canonical `splitwire/python/swp.py`; the
+vendored `swp_exl3/swp.py` is re-copied and `tests/test_swp_sync.py` passes. Rust only gains the
+`CAP_SPEC` constant (no behaviour change).
+
+**Mechanism.** `Pipeline.generate(..., spec=SpecConfig)` proposes `k` drafts from the driver side,
+sends a `k+1`-row verify forward with `rewrite=true`, and emits the accepted prefix plus the bonus
+token. The next round starts at `len(history)` and rewinds the rejected rows lazily (or clears +
+replays if a stage answers `unsupported`). `FakeBackend` keeps per-position layer inputs for recurrent
+layers, so `GDNState.rewind` semantics (only after a verify, only within the history window) are
+tested on the toy. `Pipeline.spec_check()` compares verify logits against sequential decode from the
+same state.
+
+**Tests.** New `tests/test_spec.py` (10 tests): all-accept, all-reject and mixed acceptance on 2 and 3
+stages (output exactly equals non-speculative greedy), forced illegal rewind -> clear+replay still
+exact, verify-vs-sequential logits, server rewind rules, n-gram lookup, CLI `--spec`, and `spec_k=0`
+fallback. Full suite: **32 tests, OK** (1 skips without `SWP_WEIGHTD`).
+
+## Step S2 — prompt-lookup speculation on the real engines
+
+Stages: Model B `[0,7)` / `[7,45)`, f32, chunk 2048, `spec_k = 3`. The backend now sets
+`max_history = spec_k + 1 = 4` (one extra row over the engine's `k+1`-row window). Load cost vs
+RESULTS above: Strix **111.16 GB allocated (15.35 GB free)** vs 110.80 GB, i.e. **+0.36 GB**; Razer
+still 13.30 GB (3.18 GB free).
+
+**Critical engine finding — settle every verify, including a full accept.** The recurrent state is
+provisional after a `recurrent_history` pass. The engine's generator calls `rewind(num_rejected)`
+after *every* verification, including `rewind(0)` when all drafts matched. Without that settle the
+first implementation had **4/20 top-1 mismatches and KL 2.25**; with `rewind(0)` (and lazy
+`rewind(k-m)` for partial accepts) it is **0/20 mismatches and KL 5.0e-3**. This is now in
+`Exl3Backend._settle_verify`, called before the next forward as well as from `truncate`.
+
+**Smoke check (verify logits vs sequential, 20 rows, k=3).**
+
+| check | result |
+|---|---|
+| top-1 mismatches | **0 / 20** |
+| max KL (top-8, shared, renormalised) | **5.01e-3** |
+| smoke threshold | top-1 equal and KL <= **1e-2** (relaxed from the plan's 1e-3; see below) |
+
+The 1e-3 KL gate is not reachable at k=3 because of the engine's **batched** kernels, not SWP:
+1-row verify is bit-identical (KL 0), 2-row is 3.2e-5, 3/4-row reaches 5.0e-3. A plain 4-row prefill
+(no `recurrent_history`) shows exactly the same delta as the 4-row verify, and stage 0's hidden
+boundary differs by only **max |Δ| 5.6e-4** between one 4-row forward and four 1-row forwards. Top-1
+is equal at every row and in every round. The smoke gate is therefore top-1 plus KL <= 1e-2.
+
+**Bench (warm persistent stages, greedy).**
+
+| prompt | mode | decode tok/s | stage 0 ms/tok | stage 1 ms/tok | prefill tok/s | spec rounds | accepted |
+|---|---|---|---|---|---|---|---|
+| repetitive 42-tok code | plain | **15.03** | 6.99 | 54.81 | 89.3 | — | — |
+| repetitive 42-tok code | `--spec` | **24.91** | 2.76 | 35.90 | 88.3 | 16 | **48/48 (100%)** |
+| non-repetitive 149-tok | plain | 15.05 | 6.81 | 55.05 | 175.7 | — | — |
+| non-repetitive 149-tok | `--spec` | 15.02 | 6.55 | 55.82 | 176.2 | 4 | 5/12 (41.7%) |
+| repetitive, T=0.8, 32 new | `--spec` | 23.38 | — | — | 88.4 | 8 | 24/24 (100%) |
+
+* **1.66x on repetitive output** (24.91 / 15.03), repeatable (24.90 / 24.91). One round advances
+  ~4 tokens (3 drafts + bonus) for 4 verified rows, so both stages' compute per *emitted* token drops
+  even though each verify row costs the same as a decode row.
+* **Neutral on non-repetitive output** (15.02 vs 15.05): the n-gram lookup mostly misses, and missed
+  rounds fall back to a plain 1-token decode, so there is no verify overhead.
+* **Output is byte-identical to plain greedy** on both prompts (captured stdout, `cmp`; 48 new tokens
+  each), including the non-repetitive run where only 5/12 drafts were accepted and several lazy
+  rewinds ran.
+* `T > 0` uses "sample target, accept on equality" in the head stage (seeded by `seed` + round); one
+  sampled run completed cleanly at 23.38 tok/s.
+* Aside (pre-existing Task 3 coverage): on a just-loaded pair the first 149-token prefill can be
+  1.68x the warm one, because the synthetic warm-up rows (16/64/256/512) do not include 149; the
+  second run is **0.97x**. Not caused by speculation, but worth adding ~150 rows to the warm-up.
+
 ## Other findings
 
 * **First-forward warm-up is real even with kernels cached.** A freshly loaded Razer stage spent
@@ -267,5 +342,16 @@ The final smoke (local stage 0, Strix back in its slow state) measured 15.47 tok
 
 ## State after these measurements
 
-All stage/serve processes are stopped; the Strix is idle (122 GB free), the Razer GPU is free.
-The remote `/home/m/swp/swp-exl3` tree was synced to the current local tree for the single-stage run.
+All stage/serve processes are stopped (including the S1/S2 Razer and Strix stages used for the
+speculation runs); the Strix is idle, the Razer GPU is free. The remote `/home/m/swp/swp-exl3` tree
+is synced to the current local tree. Step S3 (MTP drafter) was not started, as instructed.
+
+## Files changed for S1/S2
+
+* `swp-exl3`: `swp_exl3/{backend,server,exl3_backend,coordinator,config,cli,swp}.py`,
+  `tests/test_spec.py` (new), `tests/test_pipeline.py` (`start(..., **be_kw)`), `README.md`,
+  `examples/stage-{razer,strix}.toml`.
+* `splitwire`: `python/swp.py` (capability + spec section), `README.md` (protocol section),
+  `src/msg.rs` (`CAP_SPEC` only).
+* Stage configs were not edited beyond the defaults: `spec_k` defaults to 3, and the backend raises
+  `max_history` to 4 (`spec_k + 1`); set `spec_k = 0` in `[stage]` to disable the capability.

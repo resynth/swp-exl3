@@ -56,7 +56,7 @@ Done when the first real prefill is within ~20% of a warm one (smoke prints it).
 `EXL3_BLOCK_GRAPH`, `EXL3_HC_FOLD`, and at most one more that the Task 4 breakdown points to. One smoke + bench line each.
 Keep only what helps and passes smoke.
 
-### Task 6: persistent coordinator `swp-exl3 serve` (2-3 h)
+### Task 6: persistent coordinator `swp-exl3 serve` (2-3 h; independent of Section 4, do it after)
 Long-running process that owns the `Pipeline`; OpenAI-compatible `/v1/chat/completions` (stream, `stop`, `max_tokens`,
 `temperature`, `top_p`, `seed`) and `/v1/models`. Keeps history; reuses the longest common prefix.
 Tokenisation drift: keep the exact token ids of the previous assistant reply and splice them in when the new request's
@@ -76,20 +76,28 @@ unless long prompts matter to you (ceiling 1.17x at this cut).
 
 ## 4. Speculation (the main decode lever), in three steps with early exits
 
+**Where it runs.** Everything here is implemented in the in-process `Pipeline` request loop that already owns
+`history`, `start_pos` and the existing `rollback`/rewrite path (`Pipeline.generate`, ~:203), and is driven by the
+existing `swp-exl3 generate --bench` and `swp-exl3 smoke` commands. The stages are the already long-lived
+`swp-exl3 stage` processes. **Nothing here needs the persistent serving process of Task 6**: a fresh CLI process
+gets the same verify forward and lazy rewind, and loses only cross-request prefix reuse. While iterating, run stage 0
+as a remote stage (`addr`, not `stage_config`) so each run does not reload the Razer slice.
+
 ### Mechanism (shared by all steps)
-One round trip per round:
+The driver below is the existing `Pipeline` object; `history` is its token history, `t` the last accepted token
+(not yet fed). One round trip per round:
 ```
-coordinator: history, t (last accepted token, not yet fed), drafts d1..dk
+driver: history, t (last accepted token, not yet fed), drafts d1..dk
 FORWARD verify rows [t, d1..dk], start_pos = len(history), rewrite = true  ->  stage 0  ->  stage 1 (head)
 head stage: forward all k+1 rows; accept drafts while argmax(logits[i-1]) == d_i; m = accepted; bonus = argmax(logits[m])
             (for T>0: "sample then match": sample the target token at each row, accept a draft only if equal; exact, lower acceptance)
 reply: kind "spec" {accepted: m, tokens: [d1..dm, bonus], drafts: next drafts (MTP step only)}
-coordinator: history += [t, d1..dm]; t = bonus.   Next FORWARD's start_pos = len(history) < stage cache_len by (k - m).
+driver: history += [t, d1..dm]; t = bonus.   Next FORWARD's start_pos = len(history) < stage cache_len by (k - m).
 ```
 **Rollback is lazy and rides on `rewrite`.** A stage receiving `start_pos < cache_len` rewinds `n = cache_len - start_pos`:
 - attention / DSA caches: just move the position back (as today);
 - recurrent (KDA) state: `state.rewind(n)`, legal only if the previous forward on that stage was a **verify** forward that
-  recorded history and `n <= state.last_history` (= rows - 1). Otherwise `Unsupported`, and the coordinator falls back to
+  recorded history and `n <= state.last_history` (= rows - 1). Otherwise `Unsupported`, and the driver falls back to
   clear + replay (existing path).
 Required engine bits: verify forwards set `params["recurrent_history"] = True` on every stage (then
 `advance_recurrent_states` sets `last_history = rows - 1`); stage `Cache(..., max_history >= k)` (start k = 3, max_history 4-6).
@@ -98,13 +106,13 @@ Protocol additions (splitwire spec, capability `spec`): FORWARD `mode:"verify"`,
 FORWARD_OUT `kind:"spec"` with `accepted`, `tokens`, `drafts`, `timing`. Document the "rewind only immediately after a verify
 forward" rule. Extend `FakeBackend` with per-position state history so rewind is testable.
 
-### Step S1: protocol + coordinator loop on the fake backend (2-3 h, no GPU)
+### Step S1: protocol + speculative loop on the fake backend (2-3 h, no GPU)
 Scripted drafter (right/wrong patterns). Tests: speculative output equals non-speculative greedy exactly for all-accept,
 all-reject and mixed patterns, 2 and 3 stages; illegal rewind -> replay still correct. This is the only place exactness is
 asserted. **Exit:** tests pass.
 
 ### Step S2: n-gram / prompt-lookup drafting on the real engines (2-3 h)
-Drafts come from the coordinator (match the last 2-3 tokens against the history, propose the next k). No drafter model, no
+Drafts come from the driver side (match the last 2-3 tokens against the history, propose the next k). No drafter model, no
 embedding copy, no MTP cache. This exercises the hard part (verify batch across both stages, recurrent history, lazy rewind)
 on real hardware cheaply, and speeds up repetitive output (code, quotes, summaries).
 Smoke addition (one check): verify-forward logits at each row vs sequential decode logits from the same state, 20 tokens,
@@ -135,6 +143,8 @@ about two extra hops of 16 KiB. Draft-ahead. Both need measured per-round timing
 Cut or offload tuning (measured: every variant lost), wire quantisation (wire is ~5% of a token), per-module profiling (unless
 Task 4 points at something), cross-engine tensor/expert parallelism, prefill pipelining (<= 1.17x here), the planner rewrite,
 large multi-prompt correctness suites.
+
+## 6. Next: Plan security hardening.
 
 ## Appendix: engine pointers (verify on installed versions)
 | What | Where |

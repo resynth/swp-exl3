@@ -13,6 +13,55 @@ class StageSpec:
     layers: tuple
 
 
+def ngram_drafts(tokens, k, n=2):
+    """Prompt-lookup drafting: find the most recent earlier occurrence of the last `n` tokens and propose the
+    k tokens that followed it. `tokens` is the committed history plus the last accepted token (not yet fed)."""
+    if k <= 0 or n <= 0 or len(tokens) < n + 1:
+        return []
+    key = tuple(tokens[-n:])
+    for i in range(len(tokens) - n - 1, -1, -1):
+        if tuple(tokens[i:i + n]) == key:
+            return [int(x) for x in tokens[i + n:i + n + k]]
+    return []
+
+
+@dataclass
+class SpecConfig:
+    """Drafting policy for `Pipeline.generate(spec=...)`. `drafter(context, k)` overrides the n-gram lookup."""
+    k: int = 3
+    match: int = 2
+    accept: str = "argmax"                 # "argmax" (greedy) or "sample" (T>0: sample target, accept on equality)
+    drafter: object = None
+    seed: int = None
+
+    def propose(self, context, k):
+        if k <= 0:
+            return []
+        if self.drafter is not None:
+            return [int(x) for x in (self.drafter(list(context), k) or [])][:k]
+        for n in ((self.match, 2) if self.match != 2 else (2,)):
+            d = ngram_drafts(context, k, n)
+            if d:
+                return d
+        return []
+
+
+def compare_topk(ids_a, vals_a, ids_b, vals_b):
+    """Top-1 equality and KL over the shared top-k (renormalised). Same definition as `swp-exl3 compare`."""
+    ia, va, ib, vb = (np.asarray(ids_a), np.asarray(vals_a, dtype=np.float64),
+                      np.asarray(ids_b), np.asarray(vals_b, dtype=np.float64))
+    common = [i for i in ia if i in set(ib.tolist())]
+    da, db = dict(zip(ia.tolist(), va.tolist())), dict(zip(ib.tolist(), vb.tolist()))
+    if not common:
+        return {"top1_equal": bool(ia[0] == ib[0]), "shared": 0, "topk": len(ia), "max_abs": float("inf"), "kl": float("inf")}
+    diffs = [abs(da[i] - db[i]) for i in common]
+    pa = np.exp(np.array([da[i] for i in common]) - max(da[i] for i in common)); pa /= pa.sum()
+    pb = np.exp(np.array([db[i] for i in common]) - max(db[i] for i in common)); pb /= pb.sum()
+    kl = float((pa * np.log(pa / pb)).sum())
+    return {"top1_equal": bool(ia[0] == ib[0]), "shared": len(common), "topk": len(ia),
+            "max_abs": float(max(diffs)), "kl": kl}
+
+
 def common_prefix(a, b):
     n = min(len(a), len(b))
     i = 0
@@ -43,6 +92,7 @@ class Pipeline:
         self.secret, self.wire, self.chunk, self.contract = secret, wire_dtype, chunk, contract
         self.session, self.node, self.log = session, node, log
         self.peers, self.history, self.step, self.tail = [], [], 0, None
+        self.spec_k = 0                  # largest draft window every stage advertised (0 = no speculation)
         self.stage_configs = (list(stage_configs or []) + [None] * len(self.stages))[:len(self.stages)]
         self._local = {}                 # stage index -> LocalPeer, kept across reconnects (no reload)
         self.trace = Trace([tuple(s.layers) for s in self.stages])
@@ -65,6 +115,7 @@ class Pipeline:
     def connect(self):
         self.close()
         n = len(self.stages)
+        spec_ks = []
         for i, s in enumerate(self.stages):
             if self.stage_configs[i]:
                 p = self._local.get(i)
@@ -77,7 +128,9 @@ class Pipeline:
                 "session": self.session, "layers": list(s.layers), "has_embed": i == 0, "has_head": i == n - 1,
                 "wire_dtype": self.wire, **({"contract": self.contract} if self.contract else {})}, want=swp.STAGE_READY)
             self.tail = ready.get("tail", self.tail)
+            spec_ks.append(int(ready.get("spec_k", 0)))
             self.peers.append(p)
+        self.spec_k = min(spec_ks) if spec_ks else 0
         self.history = []
 
     def close(self):
@@ -99,7 +152,7 @@ class Pipeline:
         return out
 
     # ------------------------------------------------------------------ forward / feed
-    def _relay(self, start, toks, want, return_rows, k, phase, rewrite=False):
+    def _relay(self, start, toks, want, return_rows, k, phase, rewrite=False, extra=None):
         self.step += 1
         n, hidden = len(self.peers), b""
         res = None
@@ -108,6 +161,8 @@ class Pipeline:
             h = {"session": self.session, "step": self.step, "mode": "prefill" if len(toks) > 1 else "decode",
                  "start_pos": start, "n_rows": len(toks), "token_ids": toks, "input": "tokens" if i == 0 else "hidden",
                  "dtype": self.wire, "want": want if last else "hidden", "return_rows": return_rows, "k": k, "rewrite": rewrite}
+            if extra:
+                h.update(extra)          # mode=verify / draft_ids / accept / sampling / next_drafts
             if i > 0:
                 h["shape"] = [len(toks)] + list(self.tail)
             t = time.perf_counter()
@@ -126,6 +181,10 @@ class Pipeline:
             return ("none", None)
         if kind == "tokens":
             return ("tokens", np.frombuffer(payload, "<i4").copy())
+        if kind == "spec":
+            tokens = np.frombuffer(payload, "<i4").copy().tolist()
+            return ("spec", {"accepted": int(h.get("accepted", max(len(tokens) - 1, 0))),
+                             "tokens": [int(x) for x in tokens], "drafts": [int(x) for x in (h.get("drafts") or [])]})
         if kind == "topk":
             r, k = h["shape"]
             a = np.frombuffer(payload, "<i4", r * k).reshape(r, k).copy()
@@ -148,23 +207,34 @@ class Pipeline:
         self.connect()
         self._feed(hist, "none", "last", None, "replay")
 
-    def _feed(self, toks, want, return_rows, k, phase):
+    def _relay_recover(self, start, toks, want, return_rows, k, phase, rewrite=False, extra=None):
+        """Forward, falling back to clear+replay if a stage cannot honour the lazy rewind."""
+        try:
+            return self._relay(start, toks, want, return_rows, k, phase, rewrite=rewrite, extra=extra)
+        except swp.SwpError as e:
+            if e.code != "unsupported":
+                raise
+            self.log(f"[pipeline] lazy rewind unsupported ({e.message}); clearing and replaying {len(self.history)} tokens")
+            self._recover()
+            return self._relay(len(self.history), toks, want, return_rows, k, phase, rewrite=False, extra=extra)
+
+    def _feed(self, toks, want, return_rows, k, phase, rewrite=False):
         toks, out = list(toks), None
         for ci in range(0, len(toks), self.chunk):
             c = toks[ci:ci + self.chunk]
             last = ci + self.chunk >= len(toks)
-            out = self._relay(len(self.history), c, want if last else "none", return_rows, k, phase)
+            out = self._relay(len(self.history), c, want if last else "none", return_rows, k, phase, rewrite=rewrite)
             self.history += c
         return out
 
-    def feed(self, toks, want="none", return_rows="last", k=None, phase="prefill"):
+    def feed(self, toks, want="none", return_rows="last", k=None, phase="prefill", rewrite=False):
         """Append tokens at the current position (chunked). Only the final chunk asks the head for `want`."""
         start_len = len(self.history)
         toks = list(toks)
 
         def run():
             done = len(self.history) - start_len
-            return self._feed(toks[done:], want, return_rows, k, phase)
+            return self._feed(toks[done:], want, return_rows, k, phase, rewrite=rewrite)
         return self._guarded(run)
 
     # ------------------------------------------------------------------ cache control
@@ -173,24 +243,46 @@ class Pipeline:
             p.rpc(swp.CACHE_OP, {"session": self.session, "op": "clear"}, want=swp.CACHE_OK)
         self.history = []
 
+    def _replay_to(self, pos):
+        keep = self.history[:pos]
+        self.connect()                      # fresh connections also reset every stage (unknown state after a drop)
+        self._guarded(lambda: self._feed(keep[len(self.history):], "none", "last", None, "replay"))
+
+    def _truncate_all(self, pos):
+        for p in self.peers:
+            p.rpc(swp.CACHE_OP, {"session": self.session, "op": "truncate", "pos": pos}, want=swp.CACHE_OK)
+
     def rollback(self, pos):
         """Keep positions < pos. Stages that cannot rewind (recurrent state) answer `unsupported`; then we clear and replay."""
-        if pos >= len(self.history):
+        if pos > len(self.history):
+            return "noop"
+        if pos == len(self.history):
+            # A speculative round leaves the stage caches k-m rows past the committed history. Drop those rows;
+            # with no overshoot this is a no-op on every stage.
+            try:
+                self._truncate_all(pos)
+            except (ConnectionError, OSError):
+                return "noop"           # the next forward reconnects and replays this same history
+            except swp.SwpError as e:
+                if e.code != "unsupported":
+                    raise
+                self._replay_to(pos)
+                return "replayed"
             return "noop"
         if pos <= 0:
             self.reset()
             return "cleared"
         try:
-            for p in self.peers:
-                p.rpc(swp.CACHE_OP, {"session": self.session, "op": "truncate", "pos": pos}, want=swp.CACHE_OK)
+            self._truncate_all(pos)
             del self.history[pos:]
             return "truncated"
+        except (ConnectionError, OSError):
+            self._replay_to(pos)
+            return "replayed"
         except swp.SwpError as e:
             if e.code != "unsupported":
                 raise
-        keep = self.history[:pos]
-        self.reset()
-        self._guarded(lambda: self._feed(keep[len(self.history):], "none", "last", None, "replay"))
+        self._replay_to(pos)
         return "replayed"
 
     # ------------------------------------------------------------------ generation
@@ -200,7 +292,54 @@ class Pipeline:
         out = self.feed(prompt_ids, want="topk", k=k)
         return out[1][0][0], out[1][1][0]
 
-    def generate(self, prompt_ids, max_new=256, temperature=0.0, top_p=1.0, top_k=64, stop_ids=(), seed=None, on_token=None):
+    def _spec_loop(self, tok, want, top_k, max_new, temperature, top_p, stop_ids, spec, rng, on_token, pick):
+        """Speculative decode: propose k drafts, verify them in one k+1-row forward, emit the accepted prefix."""
+        k = max(0, min(int(spec.k), int(self.spec_k)))
+        gen = []
+        st = {"spec_rounds": 0, "spec_drafted": 0, "spec_accepted": 0}
+        while len(gen) < max_new:
+            gen.append(tok)
+            if on_token:
+                on_token(tok)
+            if tok in stop_ids or len(gen) >= max_new:
+                break
+            drafts = spec.propose(self.history + [tok], k)
+            if not drafts:
+                out = self._relay_recover(len(self.history), [tok], want, "last", top_k, "decode", rewrite=True)
+                self.history.append(tok)
+                tok = pick(out)
+                continue
+            extra = {"mode": "verify", "draft_ids": drafts,
+                     "accept": "argmax" if want == "token" else "sample",
+                     "sampling": {"temperature": temperature, "top_p": top_p, "top_k": top_k,
+                                  "seed": int(spec.seed or 0), "round": st["spec_rounds"] + 1},
+                     "next_drafts": False}
+            kind, data = self._relay_recover(len(self.history), [tok] + drafts, "spec", "all", top_k, "decode",
+                                             rewrite=True, extra=extra)
+            if kind != "spec":
+                raise swp.SwpError("bad_reply", f"verify forward answered kind={kind}")
+            m, tokens = int(data["accepted"]), data["tokens"]
+            if len(tokens) != m + 1:
+                raise swp.SwpError("bad_reply", f"spec reply has {len(tokens)} tokens for accepted={m}")
+            st["spec_rounds"] += 1
+            st["spec_drafted"] += len(drafts)
+            st["spec_accepted"] += m
+            self.history += [tok] + drafts[:m]          # committed; rejected rows are rewound lazily next round
+            for t in tokens[:-1]:
+                if len(gen) >= max_new:
+                    break
+                gen.append(int(t))
+                if on_token:
+                    on_token(int(t))
+                if t in stop_ids:
+                    return gen, st
+            tok = int(tokens[-1])                       # bonus: emitted at the top of the next round
+            if len(gen) >= max_new:
+                break
+        return gen, st
+
+    def generate(self, prompt_ids, max_new=256, temperature=0.0, top_p=1.0, top_k=64, stop_ids=(), seed=None,
+                 on_token=None, spec=None):
         rng = np.random.default_rng(seed)
         prompt = list(prompt_ids)
         keep = common_prefix(self.history, prompt)
@@ -214,17 +353,62 @@ class Pipeline:
         pre_ms = (time.perf_counter() - t0) * 1e3
         pick = (lambda o: int(o[1][0])) if want == "token" else \
             (lambda o: sample_topk(o[1][0][0], o[1][1][0], temperature, top_p, top_k, rng))
-        tok, gen, t1 = pick(out), [], time.perf_counter()
-        for i in range(max_new):
-            gen.append(tok)
-            if on_token:
-                on_token(tok)
-            if tok in stop_ids or i == max_new - 1:
-                break
-            tok = pick(self.feed([tok], want=want, k=top_k, phase="decode"))
+        tok, t1 = pick(out), time.perf_counter()
+        if spec is not None and self.spec_k > 0:
+            gen, sst = self._spec_loop(tok, want, top_k, max_new, temperature, top_p, stop_ids, spec, rng, on_token, pick)
+        else:
+            if spec is not None:
+                self.log("[pipeline] speculation requested but a stage advertises spec_k=0; plain decode")
+            gen, sst = [], {}
+            for i in range(max_new):
+                gen.append(tok)
+                if on_token:
+                    on_token(tok)
+                if tok in stop_ids or i == max_new - 1:
+                    break
+                tok = pick(self.feed([tok], want=want, k=top_k, phase="decode"))
         dec_ms = (time.perf_counter() - t1) * 1e3
-        return gen, {"prefill_tokens": len(prompt) - keep, "prefill_ms": pre_ms,
-                     "decode_tokens": max(len(gen) - 1, 0), "decode_ms": dec_ms, "reused_prefix": keep}
+        stats = {"prefill_tokens": len(prompt) - keep, "prefill_ms": pre_ms,
+                 "decode_tokens": max(len(gen) - 1, 0), "decode_ms": dec_ms, "reused_prefix": keep}
+        stats.update(sst)
+        return gen, stats
+
+    def spec_check(self, prompt_ids, rows=20, k=3, klog=8):
+        """Compare batched verify logits against sequential decode logits from the same state.
+        `rows` verify rows (whole rounds of k+1), all drafts accepted."""
+        k = max(1, min(int(k), int(self.spec_k)))
+        if self.spec_k <= 0:
+            return {"rows": 0, "top1": True, "max_kl": 0.0, "max_abs": 0.0, "k": 0, "skipped": True}
+        self.reset()
+        out = self.feed(prompt_ids, want="topk", k=klog)
+        seq = [(out[1][0][0].copy(), out[1][1][0].copy())]          # seq[i] predicts token i
+        seq_tokens = [int(out[1][0][0][0])]
+        need = rows + k + 2
+        while len(seq) < need:
+            o = self.feed([seq_tokens[-1]], want="topk", k=klog)
+            seq.append((o[1][0][0].copy(), o[1][1][0].copy()))
+            seq_tokens.append(int(o[1][0][0][0]))
+        self.reset()
+        self.feed(prompt_ids, want="none")
+        t, r, checked, bad_top1, max_kl, max_abs = seq_tokens[0], 0, 0, 0, 0.0, 0.0
+        while checked < rows:
+            kk = min(k, rows - checked - 1) if rows - checked > 1 else 0
+            drafts = seq_tokens[r + 1:r + 1 + kk]
+            if len(drafts) != kk:
+                break
+            kind, (ids, vals) = self._relay(len(self.history), [t] + drafts, "topk", "all", klog, "verify",
+                                            rewrite=True, extra={"mode": "verify", "draft_ids": drafts})
+            for j in range(ids.shape[0]):
+                ref_i, ref_v = seq[r + 1 + j]
+                c = compare_topk(ids[j], vals[j], ref_i, ref_v)
+                checked += 1
+                bad_top1 += 0 if c["top1_equal"] else 1
+                max_kl, max_abs = max(max_kl, c["kl"]), max(max_abs, c["max_abs"])
+            self.history += [t] + drafts
+            r += kk + 1
+            t = seq_tokens[r]
+        return {"rows": checked, "top1": bad_top1 == 0, "bad_top1": bad_top1,
+                "max_kl": max_kl, "max_abs": max_abs, "k": k}
 
     def report(self, stats, out=print):
         return self.trace.report(stats["prefill_tokens"], stats["prefill_ms"], max(stats["decode_tokens"], 1), stats["decode_ms"], out)

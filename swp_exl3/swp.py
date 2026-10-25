@@ -3,7 +3,35 @@ Wire format: see the SWP/1 spec doc, section A3. Interoperates with the Rust ref
 
 Canonical copy: `splitwire/python/swp.py`. This file is vendored verbatim into `swp_exl3/swp.py` so the
 adapter stays installable on its own; edit the canonical copy in splitwire and re-copy, and
-`tests/test_swp_sync.py` fails if the two diverge."""
+`tests/test_swp_sync.py` fails if the two diverge.
+
+Speculative verification (additive, capability `spec`), SWP/1 rev 2
+-------------------------------------------------------------------
+A stage advertises `spec` in its HELLO/HELLO_OK capabilities and `spec_k` (max draft tokens) in
+STAGE_READY. A FORWARD may then carry:
+
+    mode        "verify" (default when absent: "prefill"/"decode" as today)
+    draft_ids   [d_1 .. d_k], the proposed continuation; n_rows == 1 + len(draft_ids) and
+                token_ids == [t] + draft_ids (t = last accepted token, not yet fed)
+    accept      "argmax" | "sample" (how the head stage decides acceptance)
+    sampling    {"temperature", "top_p", "top_k", "seed", "round"} for accept == "sample"
+    next_drafts true -> ask a stage with a drafter for the next round's drafts (MTP, optional)
+
+Every stage that handles a verify forward records recurrent history (`last_history = n_rows - 1`),
+so the next forward may rewind up to that many rows by sending `start_pos < cache_len` with
+`rewrite: true`. A rewind is legal only immediately after a verify forward; a stage that cannot
+honour it answers ERROR `unsupported` and the coordinator clears + replays.
+
+The head stage may answer `kind: "spec"` (FORWARD_OUT) with
+
+    accepted    m, number of leading drafts the target agreed with
+    tokens      [d_1 .. d_m, bonus] (payload: int32, same order)
+    drafts      next round's drafts (empty unless a drafter is attached)
+    timing      the usual stage timing dict
+
+so one verify of k+1 rows advances the sequence by m+1 tokens. `kind: "topk"` with
+`return_rows: "all"` is the same verify without acceptance, used by the logit-equivalence check.
+"""
 import json, os, socket, struct
 
 MAGIC = b"SWP1"
@@ -13,6 +41,7 @@ CACHE_OP, CACHE_OK, SESSION_CLOSE, SESSION_CLOSED = 0x24, 0x25, 0x26, 0x27
 MANIFEST_GET, MANIFEST, TENSOR_GET, TENSOR_DATA, AUX_GET, AUX_DATA = 0x40, 0x41, 0x42, 0x43, 0x44, 0x45
 FLAG_HASH = 1
 PROTO = "swp/1"
+CAP_SPEC = "spec"                 # speculative verification; see the module docstring
 MAX_HEADER, MAX_PAYLOAD = 1 << 20, 8 << 30
 
 

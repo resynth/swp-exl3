@@ -33,7 +33,8 @@ class StageServer:
         self.lock = threading.Lock()
         self.session = None          # id of the configured session; None => must (re)configure
         self.wire = "f32"
-        self.caps = ["stage", "topk"] + [f"wire:{d}" for d in self.wire_dtypes]
+        self.caps = ["stage", "topk"] + ([swp.CAP_SPEC] if getattr(backend, "supports_spec", False) else []) \
+            + [f"wire:{d}" for d in self.wire_dtypes]
         self.debug = bool(os.environ.get("SWP_DEBUG_TIMING"))
 
     # ---- lifecycle
@@ -126,7 +127,8 @@ class StageServer:
         self.b.reset()
         self.session, self.wire = h.get("session", "s"), wd
         return swp.STAGE_READY, seq, {"session": self.session, "cache_len": 0, "tail": list(b.tail),
-                                      "contract_hash": contract_hash(b.contract), "memory": getattr(b, "memory", {})}, b""
+                                      "contract_hash": contract_hash(b.contract), "memory": getattr(b, "memory", {}),
+                                      "spec": bool(getattr(b, "supports_spec", False)), "spec_k": int(getattr(b, "spec_k", 0))}, b""
 
     def _forward(self, seq, h, payload, t_recv_start=None, t_recv_done=None):
         b = self.b
@@ -152,9 +154,25 @@ class StageServer:
             hidden = payload
         elif not b.has_embed:
             raise swp.SwpError("bad_request", "this stage has no embedding: send input=hidden")
+        spec = None
+        if h.get("mode") == "verify":
+            if swp.CAP_SPEC not in self.caps:
+                raise swp.SwpError("unsupported", "this stage does not support speculative verify forwards")
+            drafts = [int(x) for x in h.get("draft_ids", [])]
+            if len(drafts) > int(getattr(b, "spec_k", 0)):
+                raise swp.SwpError("bad_request", f"{len(drafts)} drafts exceed spec_k={getattr(b, 'spec_k', 0)}")
+            if toks != [toks[0]] + drafts:
+                raise swp.SwpError("bad_request", "verify token_ids must be [last_token] + draft_ids")
+            if h.get("want") == "spec" and not b.has_head:
+                raise swp.SwpError("bad_request", "only the head stage can answer want=spec")
+            spec = {"draft_ids": drafts, "accept": h.get("accept", "argmax"),
+                    "sampling": h.get("sampling"), "next_drafts": bool(h.get("next_drafts"))}
+            return_rows = "all" if h.get("want") in ("spec", "topk") else h.get("return_rows", "last")
+        else:
+            return_rows = h.get("return_rows", "last")
         t_pre = time.perf_counter()
         try:
-            res = b.forward(start, toks, hidden, self.wire, h.get("want", "token"), h.get("return_rows", "last"), h.get("k"))
+            res = b.forward(start, toks, hidden, self.wire, h.get("want", "token"), return_rows, h.get("k"), spec=spec)
         except Unsupported as e:
             raise swp.SwpError("unsupported", str(e))
         except Exception as e:
@@ -170,6 +188,7 @@ class StageServer:
             timing["srv_pre_ms"] = (t_pre - t_recv_done) * 1e3
         out = {"session": self.session, "step": h.get("step"), "kind": res.kind, "dtype": res.dtype, "shape": res.shape,
                "stage_ms": timing.get("compute_ms", wall), "timing": dict(timing, total_ms=wall)}
+        out.update(res.extra or {})          # e.g. accepted / tokens / drafts for kind="spec"
         return swp.FORWARD_OUT, seq, out, res.payload
 
     def _cache_op(self, seq, h):

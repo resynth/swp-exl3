@@ -42,6 +42,24 @@ def flush_hyperconnections(params, y):
     raise RuntimeError("hc_pending is set but this exllamav3 build has neither hc_flush nor HyperConnection.flush_pending")
 
 
+def _sample_row(logits, temperature, top_p, top_k, rng):
+    """Sample one token from a full-vocabulary logit row (numpy), mirroring the coordinator's top-k/top-p sampler."""
+    import numpy as np
+    if temperature <= 0:
+        return int(np.argmax(logits))
+    z = logits.astype(np.float64) / temperature
+    order = np.argsort(-z)
+    if top_k:
+        order = order[:top_k]
+    z = z[order]
+    p = np.exp(z - z.max())
+    p /= p.sum()
+    if top_p < 1.0:
+        keep = np.cumsum(p) - p < top_p
+        order, p = order[keep], p[keep] / p[keep].sum()
+    return int(order[rng.choice(len(order), p=p)])
+
+
 class Exl3Backend(Backend):
     def __init__(self, cfg, log=print):
         # Keep deferred/fused hyper-connection paths off where they are opt-in; the flush above covers the default path.
@@ -60,6 +78,11 @@ class Exl3Backend(Backend):
         a, b = cfg.layers
         self.layers, self.has_embed, self.has_head = (a, b), cfg.embed, cfg.head
         self.cache_tokens = cfg.cache_tokens
+        self.spec_k = int(getattr(cfg, "spec_k", 0) or 0)
+        self.supports_spec = self.spec_k > 0
+        # A verify forward of k+1 rows records k rows of history. The engine sizes its conv rings and staged
+        # scan inputs for max_history+1 rows, so k+1 columns is the safe setting (max_history >= k).
+        self.max_history = max(int(cfg.max_history), self.spec_k + 1 if self.spec_k else 0)
         if cfg.cache_tokens % 256 or cfg.cache_tokens < 256:
             raise ValueError("cache_tokens must be a positive multiple of 256 (page size)")
         config = Config.from_directory(cfg.model_dir)
@@ -76,10 +99,13 @@ class Exl3Backend(Backend):
         self._Cache, self._dtype_half = Cache, torch.half
         if "recurrent_dtype" not in inspect.signature(Cache.__init__).parameters and cfg.recurrent_dtype != "half":
             log(f"[warn] this exllamav3 build's Cache has no recurrent_dtype; ignoring recurrent_dtype={cfg.recurrent_dtype!r}")
+        if self.max_history > int(cfg.max_history):
+            log(f"[spec] max_history raised {cfg.max_history} -> {self.max_history} for k={self.spec_k} verify windows")
         self.cache = Cache(self.model, **_filter_kwargs(Cache.__init__, dict(
-            max_num_tokens=cfg.cache_tokens, max_batch_size=1, max_history=cfg.max_history,
+            max_num_tokens=cfg.cache_tokens, max_batch_size=1, max_history=self.max_history,
             recurrent_dtype=getattr(torch, {"half": "half", "float": "float", "bfloat16": "bfloat16"}[cfg.recurrent_dtype]))))
         self.rs, self.pos = None, 0
+        self._last_was_verify, self._last_history = False, 0
         self._host_cache = {}                                    # (n, wire_dtype) -> pinned host buffer
         self.memory = {}
 
@@ -109,6 +135,7 @@ class Exl3Backend(Backend):
     def reset(self):
         self._free_states()
         self.pos = 0
+        self._last_was_verify, self._last_history = False, 0
 
     def cache_len(self):
         return self.pos
@@ -116,15 +143,32 @@ class Exl3Backend(Backend):
     def close(self):
         self._free_states()
 
+    def _settle_verify(self, pos):
+        """Settle the previous verify pass at `pos` (the engine's `reject_remainder` equivalent).
+        This is required even when every draft was accepted (`rewind(0)`): a history pass leaves the
+        recurrent state and conv ring provisional until the rewind settles them. Legal only immediately
+        after a verify forward and within the recorded window."""
+        if not self._last_was_verify:
+            if pos < self.pos:
+                raise Unsupported("recurrent state can only be rewound right after a verify forward")
+            return
+        n = self.pos - pos
+        if n < 0 or n > self._last_history or n > self.max_history:
+            raise Unsupported(f"recurrent state can only be rewound right after a verify forward "
+                              f"(asked {n}; history {self._last_history}, capacity {self.max_history})")
+        for st in self.rs or []:
+            st.rewind(n)
+        self._sync()
+        self.pos = pos
+        self._last_was_verify, self._last_history = False, 0
+
     def truncate(self, pos):
         if pos >= self.pos:
             return
         if pos <= 0:
             return self.reset()
         if self.recurrent:
-            # Recurrent (KDA) layers carry a running state with no per-position history; the engine rewinds only via
-            # checkpoints/`recurrent_history` managed by its generator. Ask the coordinator to clear and replay.
-            raise Unsupported("recurrent state cannot be rewound to an arbitrary position; clear and replay")
+            self._settle_verify(pos)
         self.pos = pos          # attention reads only [0, past_len); later rows are overwritten
 
     # ------------------------------------------------------------------ forward
@@ -132,16 +176,21 @@ class Exl3Backend(Backend):
         if self.torch.cuda.is_available():
             self.torch.cuda.synchronize()
 
-    def forward(self, start_pos, token_ids, hidden, wire_dtype, want, return_rows, k):
+    def forward(self, start_pos, token_ids, hidden, wire_dtype, want, return_rows, k, spec=None):
         # The engine's own Model.forward() is @torch.inference_mode, but forward_ls() is not. The cache and the
         # recurrent state do in-place updates on inference tensors, which raises "Inplace update to inference
         # tensor outside InferenceMode" unless the whole pass runs inside it.
         with self.torch.inference_mode():
-            return self._forward_impl(start_pos, token_ids, hidden, wire_dtype, want, return_rows, k)
+            return self._forward_impl(start_pos, token_ids, hidden, wire_dtype, want, return_rows, k, spec)
 
-    def _forward_impl(self, start_pos, token_ids, hidden, wire_dtype, want, return_rows, k):
+    def _forward_impl(self, start_pos, token_ids, hidden, wire_dtype, want, return_rows, k, spec=None):
         t = self.torch
         m, n = self.model, len(token_ids)
+        verify = spec is not None
+        if verify and want not in ("spec", "topk", "hidden", "none"):
+            raise ValueError(f"verify forward cannot want {want!r}")
+        if self.recurrent:
+            self._settle_verify(start_pos)     # settle the previous verify pass (rewind(k-m), or rewind(0))
         t0 = time.perf_counter()
         ids = t.tensor([token_ids], dtype=t.long)
         params = {"attn_mode": "flash_attn", "cache": self.cache, "past_len": start_pos,
@@ -150,8 +199,12 @@ class Exl3Backend(Backend):
             if self.rs is None:
                 self.rs = [self.cache.get_new_state()]
             params["recurrent_states"] = self.rs
+        if verify:
+            # Record one row of recurrent history per draft. advance_recurrent_states sets
+            # last_history = n - 1, which is what a later GDNState.rewind(num_rejected) expects.
+            params["recurrent_history"] = True
         if self.has_head:
-            params["last_tokens_only"] = n if (want != "none" and return_rows == "all") else 1
+            params["last_tokens_only"] = n if (want not in ("none", "hidden") and return_rows == "all") else 1
         x = m.prepare_inputs(ids, params)
         t_prep = time.perf_counter()
         for pm in getattr(m, "_get_prefetch_layers", []):
@@ -174,6 +227,7 @@ class Exl3Backend(Backend):
         self._sync()
         t2 = time.perf_counter()
         self.pos = start_pos + n
+        self._last_was_verify, self._last_history = verify, ((n - 1) if verify else 0)
         timing = {"h2d_ms": (t1 - t0) * 1e3, "compute_ms": (t2 - t1) * 1e3,
                   "prepare_ms": (t_prep - t0) * 1e3, "prefetch_ms": (t_pf - t_prep) * 1e3,
                   "forward_ls_ms": (t_fwd - t1) * 1e3, "flush_ms": (t_flush - t_fwd) * 1e3,
@@ -188,8 +242,10 @@ class Exl3Backend(Backend):
             key = (n, wire_dtype)
             buf = self._host_cache.get(key)
             if buf is None:
+                if len(self._host_cache) >= 8:
+                    self._host_cache.clear()      # speculative decode alternates 1-row and k+1-row frames
                 buf = t.empty((n,) + self.tail, dtype=dt, pin_memory=True)     # one pinned D2H per shape
-                self._host_cache = {key: buf}
+                self._host_cache[key] = buf
             src = y[0]
             buf.copy_(src.to(dt) if src.dtype != dt else src)
             body = buf.view(t.uint8).reshape(-1).numpy()                       # byte view, no extra copy
@@ -199,7 +255,29 @@ class Exl3Backend(Backend):
         if want == "none":
             return Result("none", timing=timing)
         logits = y.float()[0]                                   # [rows, vocab]
-        if want == "token":
+        if want == "spec":
+            if not verify:
+                raise ValueError("want=spec needs mode=verify")
+            drafts = [int(d) for d in (spec or {}).get("draft_ids", [])]
+            if logits.shape[0] != len(drafts) + 1:
+                raise RuntimeError(f"verify head returned {logits.shape[0]} rows for {len(drafts)} drafts")
+            import numpy as np
+            if (spec or {}).get("accept", "argmax") == "sample":
+                s = (spec or {}).get("sampling") or {}
+                rng = np.random.default_rng([int(s.get("seed") or 0), int(s.get("round") or 0)])
+                lr = logits.cpu().numpy()
+                pred = [_sample_row(lr[i], float(s.get("temperature", 1.0)), float(s.get("top_p", 1.0)),
+                                    int(s.get("top_k") or 0), rng) for i in range(lr.shape[0])]
+            else:
+                pred = logits.argmax(-1).to(t.int32).cpu().tolist()
+            accepted = 0
+            while accepted < len(drafts) and int(pred[accepted]) == drafts[accepted]:
+                accepted += 1
+            tokens = drafts[:accepted] + [int(pred[accepted])]
+            body = np.asarray(tokens, "<i4").tobytes()
+            res = Result("spec", body, "i32", [len(tokens)],
+                         extra={"accepted": accepted, "tokens": tokens, "drafts": []})
+        elif want == "token":
             body = logits.argmax(-1).to(t.int32).cpu().numpy().tobytes()
             res = Result("tokens", body, "i32", [logits.shape[0]])
         else:

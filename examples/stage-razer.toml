@@ -11,6 +11,7 @@ device = "cuda:0"
 cache_tokens = 16384
 max_chunk = 512
 wire_dtypes = ["f32", "bf16"]
+spec_k = 3                           # speculative draft window (verify rollback); 0 disables
 
 # Set on config.infer_params before the model is built (upstream 1.6.x CPU expert offload).
 # Use ONE of: moe_cpu_offload = N MoE layers fully on CPU, or moe_cpu_split = N experts per layer on CPU.

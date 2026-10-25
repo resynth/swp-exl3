@@ -10,12 +10,12 @@ PROMPT = [5, 17, 3, 42, 9, 60, 21, 8, 33, 12, 1]
 LOG = lambda *a: None
 
 
-def start(cuts, recurrent=True, secret=None, delays=None, fails=None, n_layers=8):
+def start(cuts, recurrent=True, secret=None, delays=None, fails=None, n_layers=8, **be_kw):
     edges = [0] + list(cuts) + [n_layers]
     servers, specs = [], []
     for i in range(len(edges) - 1):
         be = FakeBackend((edges[i], edges[i + 1]), n_layers=n_layers, recurrent=recurrent,
-                         delay_ms=(delays or [0] * 9)[i], fail_calls=(fails or {}).get(i, ()))
+                         delay_ms=(delays or [0] * 9)[i], fail_calls=(fails or {}).get(i, ()), **be_kw)
         s = StageServer(be, f"n{i}", "127.0.0.1:0", secret=secret, log=LOG)
         s.bind()
         threading.Thread(target=s.serve_forever, daemon=True).start()
