@@ -98,6 +98,33 @@ def cmd_pull(a):
          include_vision=a.vision, tied_embed=a.tied_embed)
 
 
+def kyojin_speed_env(kyojin_root):
+    import ast
+    path = os.path.join(os.path.expanduser(kyojin_root), "tools", "glm", "serve.py")
+    try:
+        src = open(path, encoding="utf-8").read()
+    except OSError as e:
+        raise SystemExit(f"cannot read {path}: {e}")
+    i = src.find("SPEED_ENV = {")
+    if i < 0:
+        raise SystemExit(f"{path}: no 'SPEED_ENV = {{' block found")
+    j = src.find("\n}\n", i)
+    if j < 0:
+        raise SystemExit(f"{path}: unterminated SPEED_ENV block")
+    d = ast.literal_eval(src[i + len("SPEED_ENV = "):j + 3])
+    if not isinstance(d, dict) or not all(isinstance(k, str) and isinstance(v, (str, int, float)) for k, v in d.items()):
+        raise SystemExit(f"{path}: SPEED_ENV is not a flat str->scalar dict")
+    return d
+
+
+def cmd_speed_env(a):
+    d = kyojin_speed_env(a.kyojin_root)
+    print(f"# {len(d)} flags from {os.path.expanduser(a.kyojin_root)}/tools/glm/serve.py")
+    print("[stage.env]")
+    for k, v in d.items():
+        print(f'{k} = "{v}"')
+
+
 def cmd_ping(a):
     p, _ = _pipeline(a)
     for s, r in zip(p.stages, p.rtt_ms(100)):
@@ -311,6 +338,10 @@ def main(argv=None):
 
     s = sp.add_parser("compare", help="compare two saved logit files (cut-invariance check, step 2)")
     s.add_argument("a"); s.add_argument("b"); s.add_argument("--max-kl", type=float, default=1e-3); s.set_defaults(fn=cmd_compare)
+
+    s = sp.add_parser("speed-env", help="print Kyojin's SPEED_ENV block as a [stage.env] table")
+    s.add_argument("--kyojin-root", required=True, help="Kyojin checkout (contains tools/glm/serve.py)")
+    s.set_defaults(fn=cmd_speed_env)
 
     a = ap.parse_args(argv)
     if a.cmd == "generate" and not (a.prompt or a.prompt_file or a.ids or a.ids_file):

@@ -97,6 +97,21 @@ class T(unittest.TestCase):
         pc = config.load_pipeline(bad)
         with self.assertRaises(config.ConfigError): pc.secret()          # neither secret_env nor insecure
 
+    def test_speed_env(self):
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "tools", "glm"))
+        src = ('import torch\nSPEED_ENV = {\n    # comment\n    "EXL3_A": "1",\n    "EXL3_B": "2048",\n}\n'
+               'def main():\n    for k, v in SPEED_ENV.items():\n        pass\n')
+        open(os.path.join(d, "tools", "glm", "serve.py"), "w").write(src)
+        c, o, _ = run(["speed-env", "--kyojin-root", d])
+        self.assertEqual(c, 0)
+        self.assertIn("# 2 flags", o)
+        self.assertIn('[stage.env]', o)
+        self.assertIn('EXL3_A = "1"', o)
+        self.assertIn('EXL3_B = "2048"', o)
+        c, _, _ = run(["speed-env", "--kyojin-root", tempfile.mkdtemp()])
+        self.assertNotEqual(c, 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

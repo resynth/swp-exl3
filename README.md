@@ -8,7 +8,7 @@ Target: GLM-5.3-Flash. Seen working on a Strix Halo (Kyojin, ROCm) + a Razer (up
 CUDA); see `BRINGUP.md` and `MEASUREMENTS.md` for a full run record and benchmarks.
 
 - `swp-exl3` is one console script with subcommands: `doctor`, `stage`, `pull`, `ping`, `generate`,
-  `smoke`, `logits`, `compare`. It can also be run as `python -m swp_exl3 ...`.
+  `smoke`, `logits`, `compare`, `speed-env`. It can also be run as `python -m swp_exl3 ...`.
 - Only `stage` is machine-local work (it loads a slice and serves it). The rest are coordinator-side.
 - Every network command needs a shared secret: put `secret_env = "SWP_SECRET"` in the config and
   `export SWP_SECRET=...` on each machine, or set `insecure = true` on a trusted/direct link.
@@ -85,6 +85,25 @@ When the engine ships `exllamav3.modules.block_sparse_mlp_cpu`, `doctor` also re
 offload knobs and their defaults (`moe_cpu_offload`, `moe_cpu_split`, `moe_cpu_threads`,
 `moe_cpu_pinned_arena`, `draft_moe_cpu_*`). An engine without that module gets a warning, not a
 failure, because not every build supports CPU offload.
+
+### `swp-exl3 speed-env` — print Kyojin's engine flags as `[stage.env]`
+
+```
+swp-exl3 speed-env --kyojin-root DIR
+```
+
+Kyojin's `tools/glm/serve.py` carries a `SPEED_ENV` dict of `EXL3_*` tuning flags (30 flags in 1.5.0;
+the count and contents are read from the installed checkout, not this repo). The command evaluates it
+as data, so nothing is imported, and prints a ready-to-paste table:
+
+```bash
+swp-exl3 speed-env --kyojin-root /home/m/engines/kyojin
+# merge the printed [stage.env] into the stage file (or append it if the file has no [stage.env])
+```
+
+Only add it to a **Kyojin** stage: the flags are consumed by that engine's kernels; other builds
+simply see unknown environment names. The adapter still leaves `EXL3_PF_GR_FUSE=0` at its default,
+and an explicit value in `[stage.env]` wins over it.
 
 ### `swp-exl3 pull` — fetch one stage's tensors from a `swp-weightd`
 
