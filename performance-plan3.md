@@ -72,7 +72,7 @@ The 1.03x came from a 48-token run whose one plain bootstrap round (~130 ms) dom
   torch 2.11 headers fail at `-std=c++17` (the `ext.py` patch).
 - Record in the splitwire spec: "settle every verify, including a full accept (`rewind(0)`)" (it fixed 4/20 top-1 mismatches).
 
-## Task F: stage-side sub-chunking so the Strix can take bigger prefill chunks (conditional, 2-3 h)
+## Task F: stage-side sub-chunking so the Strix can take bigger prefill chunks (TEST DONE, didn't pass criteria)
 Kyojin's own server uses 8192-row prefill chunks (`EXL3_PREFILL_BIG_CHUNK`); the pair is capped at 2048 by the Razer's 3.2 GB free.
 **Measure before building:** on the Strix alone, prefill the 1.5k and 3k prompts at chunk 2048 vs 8192 (2 runs). If < +10%, drop this task.
 Otherwise: let stage 0 accept up to 8192 rows and run them internally as 2048-row forwards, concatenating the boundary tensors
@@ -89,10 +89,6 @@ all stages, restore it on every stage, then feed only `history[c:pos]` through t
 (<= the snapshot interval). Fake-backend tests first (extend `FakeBackend` snapshots), then one smoke. Exit: rollback in the middle of a
 4k history costs <= 1 s and output stays identical to a full replay.
 
-## Dropped
+## Dropped or defered
 Strix C-state workaround (handled separately), `EXL3_PF_GR_FUSE` test (not in GLM's own flag set), cut/offload tuning, wire quantisation,
-prefill pipelining (<= 1.17x at this cut), Razer q8 KV cache (63.9 ms/token), planner rewrite.
-
-## Order and rough budget
-A (30 min) -> B (1-2 h) -> C (1 h) -> D (30 min) -> E (30 min); F and G only on the stated conditions. A decides the rest:
-if it cuts the verify cost, B gets a higher k and D may flip to "enable MTP".
+prefill pipelining (<= 1.17x at this cut)
