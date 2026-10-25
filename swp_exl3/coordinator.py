@@ -92,6 +92,7 @@ class Pipeline:
         self.secret, self.wire, self.chunk, self.contract = secret, wire_dtype, chunk, contract
         self.session, self.node, self.log = session, node, log
         self.peers, self.history, self.step, self.tail = [], [], 0, None
+        self.replayed_tokens = 0        # tokens recomputed by clear+replay (prefix reuse lost)
         self.spec_k = 0                  # largest draft window every stage advertised (0 = no speculation)
         self.head_mtp = False            # head stage can propose next-round drafts after a verify/decode
         self.last_extra = {}             # head reply fields that are not the payload (drafts, basis, ...)
@@ -213,6 +214,7 @@ class Pipeline:
     def _recover(self):
         hist = self.history[:]
         self.connect()
+        self.replayed_tokens += len(hist)
         self._feed(hist, "none", "last", None, "replay")
 
     def _relay_recover(self, start, toks, want, return_rows, k, phase, rewrite=False, extra=None):
@@ -254,6 +256,7 @@ class Pipeline:
     def _replay_to(self, pos):
         keep = self.history[:pos]
         self.connect()                      # fresh connections also reset every stage (unknown state after a drop)
+        self.replayed_tokens += len(keep)
         self._guarded(lambda: self._feed(keep[len(self.history):], "none", "last", None, "replay"))
 
     def _truncate_all(self, pos):
@@ -384,7 +387,8 @@ class Pipeline:
         keep = common_prefix(self.history, prompt)
         if keep == len(prompt):
             keep -= 1                       # logits for the last prompt token are needed
-        self.rollback(keep)
+        replayed0 = self.replayed_tokens
+        rb = self.rollback(keep)
         want = "token" if temperature <= 0 else "topk"
         self.trace.hops.clear()
         t0 = time.perf_counter()
@@ -411,7 +415,8 @@ class Pipeline:
                 tok = pick(self.feed([tok], want=want, k=top_k, phase="decode"))
         dec_ms = (time.perf_counter() - t1) * 1e3
         stats = {"prefill_tokens": len(prompt) - keep, "prefill_ms": pre_ms,
-                 "decode_tokens": max(len(gen) - 1, 0), "decode_ms": dec_ms, "reused_prefix": keep}
+                 "decode_tokens": max(len(gen) - 1, 0), "decode_ms": dec_ms, "reused_prefix": keep,
+                 "rollback": rb, "replayed_tokens": self.replayed_tokens - replayed0}
         stats.update(sst)
         return gen, stats
 

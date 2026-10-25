@@ -40,8 +40,9 @@ JIT-compile its CUDA/HIP extension on first use (minutes); if `import exllamav3`
 stale lock at `~/.cache/torch_extensions/*/<ext>/lock` (this torch blocks while the file exists).
 
 Verified on the reference pair: **exllamav3 1.6.4** (Razer, CUDA 13.3) and **Kyojin 1.5.0** (Strix,
-ROCm 7.13). Local suite: `python -m unittest discover -s tests` → **34 tests**, all pass with
-`SWP_WEIGHTD` set; 1 self-skips without it (the provisioning test).
+ROCm 7.13). Local suite: `python -m unittest discover -s tests` → **37 tests**, all pass with
+`SWP_WEIGHTD` set; 1 self-skips without it (the provisioning test). The Kyojin HTTP integration
+(`swp_exl3/integrations/kyojin-server/`) has a separate **9-test** no-GPU suite.
 
 > Kyojin is often *not* pip-installed — its `serve.py` works from the repo root. Run `swp-exl3`
 > with the engine repo on `PYTHONPATH`, e.g.
@@ -161,6 +162,7 @@ swp-exl3 generate --pipeline FILE [--no-contract]
 | argument | default | meaning |
 |---|---|---|
 | `--prompt` / `--prompt-file` / `--ids` | — | one of these is required (`--ids` is a comma-separated token list, skipping the tokenizer) |
+| `--ids-file` | — | file of comma/space-separated token ids (for prompts too long for the command line) |
 | `--chat` | off | wrap the prompt in GLM chat format (`[gMASK]<sop>…<\|assistant\|>`) |
 | `--system` | — | system prompt, used with `--chat` |
 | `--max-new` | `128` | max new tokens |
@@ -226,10 +228,34 @@ SWP_SECRET=... swp-exl3 smoke --pipeline ~/models/pipeline-310-k7.toml --update-
 SWP_SECRET=... swp-exl3 smoke --pipeline ~/models/pipeline-310-k7.toml
 ```
 
+### `swp-kyojin-server` — persistent OpenAI-compatible coordinator
+
+`swp_exl3/integrations/kyojin-server/` runs a long-lived `Pipeline` behind Kyojin's own HTTP layer
+(`tools/glm/serve.py`): `/v1/chat/completions` (stream, templates, reasoning/tool parsing), `/v1/completions`,
+`/v1/models`, `/health`, `/tokenize`, `/metrics`. Start the stage servers first, then on a machine that has the Kyojin
+checkout (the Strix):
+
+```bash
+python swp_kyojin_server.py --pipeline pipeline.toml --model-dir /models/GLM-5.3-Flash-exl3 \
+  --kyojin-root ~/engines/kyojin --ctx 8192 --host 0.0.0.0 --port 8000 [--spec]
+```
+
+`--ctx` is the smallest stage `cache_tokens`. The server keeps history and reuses the longest common prefix, including
+exact token ids of the previous reply, so appended turns prefill only the new text; a trimmed/edited reply triggers the
+normal clear+replay and is reported as `replayed_tokens` (with `cached_tokens = 0`). Each request prints a terminal
+line with the cache verdict (`HIT n/m` / `MISS` / `MISS (replayed n)`), prefill tokens and tok/s (new and effective),
+decode tokens and tok/s, and — when drafting — the speculative acceptance (`spec 48/48 (100.0%, 16 rounds)`).
+`--spec` enables the n-gram speculative path (neutral on novel text, ~1.7x on repetitive). Tool calls work non-stream
+and streamed (`finish_reason: "tool_calls"`, `role: "tool"` follow-ups); `--ctx` (the smallest stage
+`cache_tokens`) is the context cap, and over-context prompts get a clean HTTP 400. The pair is not limited
+to 8192: 128k tokens were measured, and 576k fp16 / 768k q8 caches load (see §5.1 and `RESULTS.md` T5).
+No auth/TLS and one request at a time — bind loopback or a trusted link.
+See its `README.md` for tests and limits.
+
 ### `swp-exl3 logits` / `compare` — cut-invariance check
 
 ```
-swp-exl3 logits  --pipeline FILE [--no-contract] (--prompt TEXT | --ids a,b) [--k N] --save FILE
+swp-exl3 logits  --pipeline FILE [--no-contract] (--prompt TEXT | --ids a,b | --ids-file FILE) [--k N] --save FILE
 swp-exl3 compare A.json B.json [--max-kl F]
 ```
 
@@ -261,6 +287,7 @@ embed       = true               # first stage: holds the embedding
 head        = false              # last stage: holds hc_head + norm + lm_head
 device      = "cuda:0"           # single device (HIP also presents as cuda:0)
 cache_tokens = 8192              # KV/recurrent cache; multiple of 256
+cache_bits  = 0                  # 0 = fp16 KV cache, 8 = packed int8 KV (CacheLayer_quant; longer context)
 max_chunk   = 512                # max rows per FORWARD
 wire_dtypes = ["f32", "bf16"]    # accepted wire dtypes
 warmup      = true               # synthetic forwards after load() so the first real prefill is not cold
@@ -372,6 +399,42 @@ The cut and the expert placement are the two knobs; both are measured in `MEASUR
 * Probe the link first: `swp-drive --probe --stages <host>:7802 --hidden 16384` (the boundary row is
   `hc_mult*hidden*4 = 64 KiB` at f32).
 
+### 5.1 Context and quantized KV
+
+The 8192-token cap in earlier notes was a **config value** (`cache_tokens` on the Razer/Strix, and
+`--ctx 8192` on the server), not a model or engine limit: the checkpoint declares
+`max_position_embeddings = 1,048,576`. At cut 7 the Razer holds only one global-attention layer, so
+the Strix's 10 attention layers are the binding KV budget. Measured on Model B, f32, warm stages:
+
+| stage | KV | largest cache that loads + warms | free after load |
+|---|---|---|---|
+| Razer `[0,7)` | fp16 | 832k | 1.83 GB |
+| Strix `[7,45)` | fp16 | **576k** | 5.94 GB |
+| Strix `[7,45)` | q8 | **768k** (832k absolute ceiling, slow first forward) | 6.57 GB (5.84 GB) |
+
+`cache_bits = 8` selects the packed int8 MLA/DSA pages (`CacheLayer_quant`) and raises the Strix
+ceiling from 576k to 768–832k. It is **opt-in and not bit-identical**: top-1 logits stay equal at
+8k/32k, but greedy text drifts from the fp16 golden, so keep `0` unless a context above ~576k is the
+goal. On an engine without the packed cache it is a startup error (not a silent fp16 fallback);
+`doctor` warns when the capability is absent. q8 is also **Strix-only** here: on the Razer's CUDA
+build the one quantized MLA layer costs 63.9 ms/token at 8k vs 8.6 ms fp16.
+
+Throughput at long context (Model B, cut 7, chunk 2048, fp16 on Razer):
+
+| prompt | Strix KV | prefill tok/s | decode tok/s |
+|---|---|---|---|
+| 8,192 | fp16 | 456.6 | 13.34 |
+| 8,192 | q8 | 453.2 | 13.20 |
+| 32,768 | fp16 | 457.1 | 12.97 |
+| 32,768 | q8 | 448.9 | 13.55 |
+| 131,072 | fp16 | 443.5 | 11.27 |
+| 131,072 | q8 | 414.5 | 9.40 |
+
+For long prompts, size the cache for **prompt + generation + spec window** (a forward past
+`cache_tokens` is now rejected as `context_exceeded`), and keep headroom: prefill workspace grows with
+`chunk × context`, and the 832k q8 config could not prefill 128k tokens at chunk 2048 even though it
+loaded. The 128k rows above use a 256k cache. Full tables and caveats are in `RESULTS.md` T5.
+
 ---
 
 ## 6. What GLM-5.3-Flash is (from `Glm5NextModel`)
@@ -413,6 +476,9 @@ Hybrid KDA linear attention (recurrent state) + MLA/DSA, MoE, **mHC hyper-connec
   also runs the head on the final row of each chunk.
 * bf16 wire and `topk` output are implemented; the cut/offload equivalence checks in `MEASUREMENTS.md`
   cover them on real engines. Authentication is not encryption.
+* `cache_bits = 8` (packed int8 MLA/DSA pages) is opt-in and **not bit-identical**: it raises the Strix
+  cache ceiling from 576k to 768–832k tokens, but greedy text drifts from the fp16 golden. It is also
+  slow on the Razer's CUDA engine, so use it on the Strix only. `cache_bits = 0` remains the default.
 * Every `generate` is a fresh process and pays a per-process kernel warmup on the first prefill; a
   long-lived coordinator would remove that.
 * Remote latency depends on the peer's CPU power state: after ~7 ms idle (the time the other stage

@@ -10,6 +10,20 @@ def _encode(tok, text):
     return [int(i) for i in tok.encode(text, encode_special_tokens=True).flatten().tolist()]
 
 
+def _read_ids_file(path):
+    return [int(x) for x in open(path).read().replace(",", " ").split()]
+
+
+def _ids_arg(a, tok, chat=False, system=None):
+    """Token ids from --ids, --ids-file, --prompt-file or --prompt, in that order."""
+    if a.ids:
+        return [int(x) for x in a.ids.split(",")]
+    if getattr(a, "ids_file", None):
+        return _read_ids_file(a.ids_file)
+    text = open(a.prompt_file).read() if getattr(a, "prompt_file", None) else a.prompt
+    return _encode(tok, glm_chat(text, system) if chat else text)
+
+
 def glm_chat(prompt, system=None):
     """GLM-5.x chat format (copied from exllamav3's Glm5NextModel.default_chat_prompt)."""
     s = "[gMASK]<sop>"
@@ -104,11 +118,7 @@ def cmd_generate(a):
     from .coordinator import SpecConfig
     p, pc = _pipeline(a)
     tok = _tokenizer(pc.model_dir) if pc.model_dir else None
-    if a.ids:
-        ids = [int(x) for x in a.ids.split(",")]
-    else:
-        text = open(a.prompt_file).read() if a.prompt_file else a.prompt
-        ids = _encode(tok, glm_chat(text, a.system) if a.chat else text)
+    ids = _ids_arg(a, tok, a.chat, a.system)
     vocab, stops = None, set()
     if tok is not None:
         vocab = tok.get_id_to_piece_list()
@@ -144,7 +154,7 @@ def cmd_generate(a):
 
 def cmd_logits(a):
     p, pc = _pipeline(a)
-    ids = [int(x) for x in a.ids.split(",")] if a.ids else _encode(_tokenizer(pc.model_dir), a.prompt)
+    ids = _ids_arg(a, None) if (a.ids or getattr(a, "ids_file", None)) else _ids_arg(a, _tokenizer(pc.model_dir))
     ti, tv = p.logits_topk(ids, a.k)
     json.dump({"stages": [list(s.layers) for s in p.stages], "wire": pc.wire_dtype, "prompt_ids": ids,
                "ids": ti.tolist(), "logits": tv.tolist()}, open(a.save, "w"))
@@ -282,7 +292,7 @@ def main(argv=None):
     s = sp.add_parser("ping", help="TCP round trip to each stage"); pl(s); s.set_defaults(fn=cmd_ping)
 
     s = sp.add_parser("generate", help="generate text through the pipeline (prefill/decode tok/s with --bench)"); pl(s)
-    s.add_argument("--prompt"); s.add_argument("--prompt-file"); s.add_argument("--ids"); s.add_argument("--chat", action="store_true"); s.add_argument("--system")
+    s.add_argument("--prompt"); s.add_argument("--prompt-file"); s.add_argument("--ids"); s.add_argument("--ids-file", help="file of comma/space-separated token ids (long prompts)"); s.add_argument("--chat", action="store_true"); s.add_argument("--system")
     s.add_argument("--max-new", type=int, default=128); s.add_argument("--temperature", type=float, default=0.0); s.add_argument("--top-p", type=float, default=1.0)
     s.add_argument("--seed", type=int); s.add_argument("--stop-id", action="append"); s.add_argument("--bench", action="store_true"); s.add_argument("--json")
     s.add_argument("--spec", action="store_true", help="speculative decode with prompt-lookup (n-gram) drafting")
@@ -297,13 +307,13 @@ def main(argv=None):
     s.set_defaults(fn=cmd_smoke)
 
     s = sp.add_parser("logits", help="save top-k logits for a prompt (cut-invariance check, step 1)"); pl(s)
-    s.add_argument("--prompt"); s.add_argument("--ids"); s.add_argument("--k", type=int, default=64); s.add_argument("--save", required=True); s.set_defaults(fn=cmd_logits)
+    s.add_argument("--prompt"); s.add_argument("--ids"); s.add_argument("--ids-file"); s.add_argument("--k", type=int, default=64); s.add_argument("--save", required=True); s.set_defaults(fn=cmd_logits)
 
     s = sp.add_parser("compare", help="compare two saved logit files (cut-invariance check, step 2)")
     s.add_argument("a"); s.add_argument("b"); s.add_argument("--max-kl", type=float, default=1e-3); s.set_defaults(fn=cmd_compare)
 
     a = ap.parse_args(argv)
-    if a.cmd == "generate" and not (a.prompt or a.prompt_file or a.ids):
+    if a.cmd == "generate" and not (a.prompt or a.prompt_file or a.ids or a.ids_file):
         ap.error("generate needs --prompt, --prompt-file or --ids")
     sys.exit(a.fn(a) or 0)
 

@@ -196,6 +196,120 @@ max |Δlogit| 0.00000, KL 0.00e+00).
   on both stages — set in `~/models/stage-310-razer-k7.toml` and `/home/m/swp/stage-310-strix-base.toml`.
   The Task 1 golden is unaffected (all smoke prompts are a single chunk).
 
+## T5 — quantized KV cache (`cache_bits`)
+
+`[stage] cache_bits = 0|8` is implemented (per stage, default 0). With `8` the adapter builds
+`Cache(layer_type=CacheLayer_quant, k_bits=8, v_bits=8)`; it is inspect-guarded on both `Cache` and
+`CacheLayer_quant` and **fails fast** with a clear error if `cache_bits = 8` is requested on an engine
+without them (use `cache_bits = 0` there; silently downgrading would allocate the fp16 cache at the
+q8-sized `cache_tokens`). `doctor` reports
+the capability. Kyojin's `Cache` has no `recurrent_dtype` but forwards unknown kwargs into the cache
+layer, so the adapter now only passes `recurrent_dtype` when `Cache.__init__` declares it (main cache
+and MTP drafter cache).
+Unit suite: **37 tests, OK** (1 skips without `SWP_WEIGHTD`); `doctor` **19/19** on both engines.
+
+**Kyojin caveat (not an upstream exllamav3 bug).** Kyojin 1.5.0's `Cache` lacks the upstream
+`recurrent_dtype` parameter but accepts `**kwargs` and forwards them to the cache-layer constructors.
+`CacheLayer_MLA_fp16` tolerates the extra keyword; `CacheLayer_MLA_quant` does not, which is why the
+combination `cache_bits = 8` + `recurrent_dtype` crashed. Upstream exllamav3 1.6.4 declares the
+parameter, so this is a Kyojin feature gap plus an over-broad kwargs forward. The adapter now passes
+`recurrent_dtype` only when `Cache.__init__` declares it; worth reporting to Kyojin (declare the
+parameter, or drop unknown kwargs before constructing layers).
+
+Cache geometry measured from the installed engines (Model B, cut 7):
+| slice | global-attn cache layers | fp16 | q8 |
+|---|---|---|---|
+| Razer `[0,7)` | 1 | 1600 B/token | 1120 B/token |
+| Strix `[7,45)` | 10 | 16000 B/token | 11200 B/token |
+
+At 64k cache that is 0.105 / 0.073 GB on the Razer and 1.049 / 0.734 GB on the Strix. The Razer is
+not the context limit at this cut; the Strix is.
+
+### T5.1 Measured maximum cache (load + warm-up)
+
+Model B cut 7, f32 wire, `spec_k = 4`, chunk 2048. "Loads" means the stage reached `listening` and
+completed the 7 synthetic warm-up forwards.
+
+| stage | cache dtype | largest tested that loads | free after load | first tested failure |
+|---|---|---|---|---|
+| Razer `[0,7)` | fp16 | **851,968 (832k)** | 1.83 GB | not tried higher (not binding) |
+| Strix `[7,45)` | fp16 | **589,824 (576k)** | 5.94 GB | **655,360 (640k)**: 4.90 GB free, first warm-up forward fails |
+| Strix `[7,45)` | q8 | **851,968 (832k)** | 5.84 GB (first forward 18.6 s) | **917,504 (896k)**: 5.11 GB free, first forward fails; **1,048,576** OOMs during load |
+| Strix `[7,45)` | q8 | 786,432 (768k) — normal warm-up | 6.57 GB (first forward 4.1 s) | — |
+
+q8 raises the Strix's measured allocation ceiling from **576k to 832k** (1.44x, exactly the
+16000/11200 byte ratio). 832k is the absolute ceiling but its first forward took 18.6 s versus 4.1 s
+at 768k, so **768k is the practical maximum**. The model's own limit is 1,048,576; the loader/workspace
+needs ~5 GB free and 1M q8 leaves less than that.
+
+Cut 7 is the max-context split, so no split sweep is needed: it is the largest all-GPU Razer range
+(`MEASUREMENTS.md` §4.1) and gives the Strix the smallest weight footprint it can have without Razer
+CPU offload. Moving the cut down adds layers (and KV pages) to the Strix; moving it up makes the Razer
+need offload, which costs more Razer free memory than the extra attention layer saves. Neither can beat
+the model's 1,048,576 limit, and both lower the measured ceiling.
+
+### T5.2 Throughput vs context (warm stages)
+
+Razer/Strix mean the KV cache dtype on each stage. All rows f32 wire, chunk 2048, greedy, 8–47 new
+tokens. `8k`/`32k` q8 rows use a 64k cache; the 128k rows use 256k; cache size does not change
+per-token compute.
+
+| prompt | Razer / Strix KV | prefill tok/s | decode tok/s | stage 0 ms/tok | stage 1 ms/tok | wire+q s0 / s1 |
+|---|---|---|---|---|---|---|
+| 149 (existing baseline) | fp16 / fp16 | 174.9 | 15.31 | 6.83 | 54.31 | — |
+| 8,192 | fp16 / fp16 | 456.6 | **13.34** | 8.57 | 61.16 | 1.39 / 3.70 |
+| 32,768 | fp16 / fp16 | 457.1 | **12.97** | 14.54 † | 57.19 | 1.56 / 3.65 |
+| 131,072 | fp16 / fp16 | 443.5 | **11.27** | 6.55 | 77.00 | 0.64 / 4.50 |
+| 8,192 | fp16 / **q8** | 453.2 | **13.20** | 7.11 | 62.80 | 1.38 / 4.26 |
+| 32,768 | fp16 / **q8** | 448.9 | **13.55** | 6.92 | 61.42 | 1.30 / 4.01 |
+| 131,072 | fp16 / **q8** | 414.5 | **9.40** | 6.66 | 94.14 | 0.90 / 4.57 |
+| 8,192 | **q8 / q8** | 453.9 | **7.35** | 63.89 | 67.30 | 1.38 / 3.44 |
+
+† Single-run stage-0 timing; other 32k/128k runs measured 6.5–7.0 ms. The wall decode rate is the
+comparable figure.
+
+* **q8 on the Strix is nearly free at 8k/32k** (decode 13.20/13.55 vs 13.34/12.97) and costs **~17%
+  decode at 128k** (9.40 vs 11.27), because all 10 global-attn layers now read quantized pages.
+* **q8 on the Razer is not usable**: at 8k its single attention layer costs **63.9 ms/token** versus
+  8.6 ms fp16, and the pair drops to **7.35 tok/s**. Use q8 on the Strix only. (The 32k q8/q8 run hit
+  the old "prompt == cache" fault, so it is not a data point.)
+* The 8192 limit was a config choice, not a model/engine limit. 128k prefill/decode is measured above;
+  576k fp16 / 768k q8 caches load on the Strix.
+* **Control after the T5 code changes (149 tokens, same remote pair, fp16, cache 64k):** decode
+  **15.03 tok/s**, stage 0 **7.146** ms/tok, stage 1 **54.955** ms/tok, prefill **174.8 tok/s**,
+  smoke **PASS** (golden text and logits 64/64, KL 0). This matches RESULTS rows 2 (15.31 / 6.834 /
+  54.313) and 6 (15.05 / 7.181 / 54.794) within run-to-run noise; the lower 8k/32k/128k decode rates
+  are context cost, not a code regression.
+
+### T5.3 Correctness
+
+Top-64 logits, q8-on-Strix vs fp16-on-Strix (Razer fp16 in both):
+
+| prompt | top-1 | shared top-64 | max abs Δlogit | KL(A‖B) |
+|---|---|---|---|---|
+| 8,192 | equal | 62/64 | 0.578 | 5.61e-08 |
+| 32,768 | equal | 60/64 | 0.656 | 4.12e-08 |
+
+The smoke gate against the fp16 golden **fails**: greedy text differs at the second token on the
+capital prompt, and the 5-token top-64 check has KL 1.16e-3 (gate 1e-4); the speculative verify check
+is 6.33e-4 (gate 1e-2). q8 is therefore a **context-headroom trade-off, not an accuracy-neutral
+drop-in**. Keep `cache_bits = 0` as the default; enable 8 on the Strix only when a context above the
+fp16 ceiling (~576k) is required.
+
+### T5.4 Caveats
+
+* **Reserve room for generated tokens.** With `cache_tokens == prompt length`, the first generated
+  token writes past the cache and the CUDA stage faults with an illegal memory access (seen on both
+  fp16 and q8). `StageServer` now rejects it with `context_exceeded`; size the cache for
+  prompt + generation + spec window.
+* **Maximum cache ≠ maximum runnable prompt.** The 832k q8 stage (5.84 GB free) could not prefill a
+  128k prompt at chunk 2048 (`hipBLASCreate` allocation failure); the same 128k prompt ran with a
+  256k cache (12.45 GB free). Prefill workspace still scales with chunk×context. For long prompts use
+  cache ≈ 2× the desired context (or reduce `max_chunk`/`chunk`).
+* **q8 is slower as context grows**: 8k/32k are within noise, 128k loses ~7% prefill and ~17% decode.
+* q8 needs the engine's packed-MLA/DSA cache path; `doctor` reports it and the adapter raises a clear
+  startup error where it is absent (`cache_bits = 0` there).
+
 ## Task 4 — decode overhead (4.2–4.5 ms/token)
 
 Measured with the real pair, 20 decode tokens per run, `SWP_DEBUG_TIMING=1`, and a raw RPC probe
@@ -407,6 +521,72 @@ Stop at the gate. Keep the implementation (config `mtp = false` by default) and 
 If MTP is revisited, the lever is the target verify cost, not the drafter: the 2-row round already
 costs ~120 ms of a 66.5 ms token budget.
 
+## Task 6 — persistent coordinator (`swp-kyojin-server`)
+
+`swp_exl3/integrations/kyojin-server/` serves a long-lived `Pipeline` through Kyojin's own OpenAI-compatible HTTP layer
+(`tools/glm/serve.py`). It owns one `Pipeline`, keeps history across requests, reuses the longest common prefix (with the
+exact token ids of the previous reply), and exposes `/v1/chat/completions` (stream), `/v1/completions`, `/v1/models`,
+`/health`, `/tokenize`, `/metrics`. Run on the Strix; stage 0 stays remote on the Razer and stage 1 is local.
+
+**Bench** (Model B cut 7, f32, chunk 2048, warm stages; same smoke prompt, 149 raw tokens / 48 new; streaming client,
+decode = completion tokens ÷ (last delta − first delta)). The first column is the existing CLI smoke run on the same pair.
+
+| path | prompt | decode tok/s | TTFT | notes |
+|---|---|---|---|---|
+| `swp-exl3 smoke` (CLI) | 149 tok raw | 14.88 | 859 ms prefill | stage 0 7.139 / stage 1 55.067 ms/tok |
+| server, plain | 149 tok raw | **15.20 / 15.20** | 860 / 944 ms | matches the CLI; `/v1/completions` |
+| server, plain | repetitive, 64 new | 15.22 / 15.18 | 604 / 684 ms | 31-token prompt |
+| server, `--spec` | 149 tok raw | 15.44 / 15.15 | 846 / 935 ms | neutral, as in S2 |
+| server, `--spec` | repetitive, 64 new | **25.89 / 25.09** | 601 / 683 ms | **1.65–1.70x** plain; 159/180 drafts accepted (88%) |
+
+Multi-turn (real tokenizer/template, 8 new tokens per turn): turn 1 is 94 prompt tokens; the append turn is 116 prompt
+tokens with **102 cached**, so only **14 tokens** are prefilled (308 ms, 45 tok/s) and there is no replay. Re-asking the
+first turn while its reply is in history trims the recurrent state, so it **replays**: `cached_tokens = 0`,
+`rollback = replayed`, `replayed_tokens = 93`, prefill 798 ms, identical answer. With the medium template the rendered
+chat prompt is larger than the raw prompt (reasoning-effort system lines; 232 tokens for the 149-token smoke prompt), and
+a client that drops/normalises `reasoning_content` loses reuse inside the reply and replays; echoing it can still hit
+(e.g. 279/295 cached, 16 fed in one run). This is the tokenisation-drift caveat from the plan, not a protocol bug.
+
+**Replay accounting (new).** `Pipeline.generate` now returns `rollback` (`noop/cleared/truncated/replayed`) and
+`replayed_tokens`; the server reports physical cache hits (`cached_tokens = 0` when a replay recomputed the prefix) and
+prints one line per request with the cache verdict and both rates:
+
+```
+[req 2] HIT 101/113 | prefill 12 new + 101 cached in 281 ms (42.8 new tok/s, 402.8 effective) | decode 13 tok in 1119 ms (10.7 tok/s)
+[req 3] MISS (replayed 92) | prefill 93 new + 0 cached in 803 ms (115.9 new tok/s, 115.9 effective) | decode 8 tok in 553 ms (12.7 tok/s)
+[req 1] MISS | prefill 31 new + 0 cached in 623 ms (49.8 new tok/s, 49.8 effective) | decode 64 tok in 2411 ms (26.1 tok/s) | spec 48/48 (100.0%, 16 rounds)
+```
+
+`HIT n/m` is the kept prefix, `MISS` a cold/different prompt, `MISS (replayed n)` a prefix that had to be recomputed;
+`new tok/s` is over the fed rows, `effective` over the whole prompt (what the cache bought); `spec accepted/proposed
+(%, rounds)` is present only when the request drafted. The same server run measured **48/48 (100%)** on the repetitive
+prompt and **10/21 (47.6%, 7 rounds)** on a 15-token novel prompt (15.6 tok/s, neutral).
+
+**Tests / checks.**
+* Integration suite (no GPU, Kyojin 1.5.0's real HTTP layer + fake pipeline and tokenizer): **9 tests, OK** — endpoints,
+  non-stream equals a direct pipeline run, stream equals non-stream, stop strings, multi-turn append with no replay,
+  trim replay accounting, the terminal HIT/MISS/rate line and the spec-acceptance field, exact-id splicing/fallbacks,
+  cancel mid-stream, one-time sampler warning.
+* Unit suite: **34 tests, OK** on the Razer and on the Strix (1 skips without `SWP_WEIGHTD`).
+* `swp-exl3 smoke`: **PASS** on the stage pair (token-identical to the golden; top-1 equal, KL 0).
+* Real server: `/v1/models`, `/health`, `/tokenize`, `/metrics` all 200; sampled (`T=0.8`, `top_p=0.95`, seed) and greedy
+  requests through `--spec` complete; a client disconnect mid-stream is cancelled and the next request succeeds.
+* **Tool calls** (real server, `tools` + `tool_choice`/auto): non-stream and stream both return
+  `finish_reason = "tool_calls"` with a parsed `tool_calls` entry (`get_weather`, `{"city": "Paris"}`); a follow-up with
+  `role: "tool"` returns the final answer and reuses 260/269 prompt tokens. Streaming holds tool XML until it is complete
+  and emits it as `delta.tool_calls`.
+* **Context guard**: an over-context request is refused before prefill with HTTP 400
+  (`"context length exceeded: prompt is 9001 tokens, the server context is 8192"`), not a stage error. Agent harnesses
+  must keep system prompt + tools + history within the pair's 8192-token cache (the Razer stage is the cap).
+
+**Files.** `swp_exl3/coordinator.py` (replay stats), `swp_exl3/integrations/kyojin-server/{swp_kyojin_server.py,
+test_swp_kyojin_server.py,README.md}` (server, 7th test, spec flags, replay-aware cached tokens, per-request log),
+`tests/test_pipeline.py` (replay assertions), `README.md` (server section).
+
+**Limits.** One request at a time (Kyojin queues the rest); no images; min_p/penalties/logit_bias/grammar ignored with a
+one-time warning; MTP stays off (the `--spec` n-gram path is wired instead). The pipeline's 8192-token cache is still the
+pair's context cap.
+
 ## Other findings
 
 * **First-forward warm-up is real even with kernels cached.** A freshly loaded Razer stage spent
@@ -425,6 +605,27 @@ All stage/serve processes are stopped (including the S3 Razer and Strix stages);
 the Razer GPU is free. The remote `/home/m/swp/swp-exl3` tree is synced to the current local tree.
 The Strix stage config is left with `mtp = false` (the measured default); enable it with
 `mtp = true` and `mtp_cache_tokens = 8192` to reproduce the S3 rows.
+The persistent `swp-kyojin-server` is stopped too. Its Strix pipeline config is
+`/home/m/swp/pipeline-310-k7-server.toml` (stage 0 `10.10.10.1:7801`, stage 1 `127.0.0.1:7802`); start it with
+`--spec` to reproduce the n-gram server rows in Task 6.
+
+For T5 all q8 stages are stopped as well. The configs used are on the Razer in `~/models/`
+(`stage-310-razer-k7-{f16,256k,832k}.toml`, plus q8 variants) and on the Strix in `/home/m/swp/`
+(`stage-310-strix-k7-{f16,q8}{,-256k,-576k,-640k,-768k,-832k,-896k,-1m}.toml`). The 128k id file is
+`/tmp/kilo/ids-131072.txt`; regenerate long prompts with `/tmp/kilo/make_ids.py <model_dir> <n> <out>`
+(the measurement helper is intentionally outside the repo). Start the comparable pair with the Razer
+`stage-310-razer-k7-256k.toml` and Strix `stage-310-strix-k7-q8-256k.toml` (or `-f16-256k` for the
+control) and `pipeline-310-k7-q8.toml`.
+
+## Files changed for T5
+
+* `swp-exl3`: `swp_exl3/config.py` (`cache_bits`), `swp_exl3/exl3_backend.py` (quant cache kwargs,
+  `recurrent_dtype` guard, cache/recurrent bytes in `memory`), `swp_exl3/doctor.py` (capability check),
+  `swp_exl3/server.py` (`context_exceeded` guard), `swp_exl3/cli.py` (`--ids-file` for `generate` and
+  `logits`), `tests/test_config.py`, `tests/test_pipeline.py`, `examples/stage-{razer,strix}.toml`,
+  `README.md`.
+* Stage configs: `~/models/stage-310-razer-k7-{f16,256k,832k}.toml` on the Razer;
+  `/home/m/swp/stage-310-strix-k7-{f16,q8}-{256k,576k,640k,768k,832k,896k}.toml` on the Strix.
 
 ## Files changed for S1/S2/S3
 

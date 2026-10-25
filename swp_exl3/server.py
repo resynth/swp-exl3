@@ -148,6 +148,11 @@ class StageServer:
                     raise swp.SwpError("unsupported", str(e))
             else:
                 raise swp.SwpError("pos_mismatch", f"expected start_pos {b.cache_len()} got {start}")
+        cap = int(getattr(b, "cache_tokens", 0) or 0)
+        if cap and start + n > cap:          # the engine writes past the paged cache and faults on CUDA
+            raise swp.SwpError("context_exceeded",
+                               f"forward needs {start + n} tokens, cache_tokens={cap}; "
+                               f"raise cache_tokens or shorten the prompt/generation")
         hidden = None
         if h.get("input") == "hidden":
             need = n * int(np.prod(b.tail)) * DTYPE_BYTES[self.wire]

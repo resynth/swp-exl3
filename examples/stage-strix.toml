@@ -12,6 +12,7 @@ device = "cuda:0"
 cache_tokens = 16384                 # KV/state cache, multiple of 256
 max_chunk = 512                      # rows per FORWARD (boundary row = hc_mult*hidden*4 bytes = 64 KiB at f32 for GLM-5.3)
 wire_dtypes = ["f32", "bf16"]
+cache_bits = 0                       # 0 = fp16 KV cache; 8 = packed int8 KV (CacheLayer_quant, longer context)
 
 spec_k = 3                           # speculative draft window (verify rollback); 0 disables
 # mtp = true                         # head stage only: MTP drafter + read-only embedding copy (S3: no win here)
