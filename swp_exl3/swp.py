@@ -29,16 +29,30 @@ def _recv_exact(sock, n):
     return buf
 
 
+def _send_iov(sock, bufs):
+    """One sendmsg for the common case; loops only if the kernel takes a short write."""
+    mvs = [memoryview(b) for b in bufs if len(b)]
+    i = 0
+    while i < len(mvs):
+        n = sock.sendmsg(mvs[i:])
+        if n <= 0:
+            raise ConnectionError("send failed")
+        while i < len(mvs) and n >= mvs[i].nbytes:
+            n -= mvs[i].nbytes
+            i += 1
+        if i < len(mvs) and n:
+            mvs[i] = mvs[i][n:]
+
+
 def send_frame(sock, kind, seq, header, payload=b"", hash=False):
     hdr = json.dumps(header, separators=(",", ":")).encode()
     if len(hdr) > MAX_HEADER:
         raise SwpError("bad_request", "header too large")
-    sock.sendall(MAGIC + struct.pack("<BBHIIQ", kind, FLAG_HASH if hash else 0, 0, seq, len(hdr), len(payload)) + hdr)
-    if len(payload):
-        sock.sendall(payload)
+    bufs = [MAGIC + struct.pack("<BBHIIQ", kind, FLAG_HASH if hash else 0, 0, seq, len(hdr), len(payload)), hdr, payload]
     if hash:
         import blake3
-        sock.sendall(blake3.blake3(bytes(payload)).digest()[:16])
+        bufs.append(blake3.blake3(bytes(payload)).digest()[:16])
+    _send_iov(sock, bufs)
 
 
 def recv_frame(sock):

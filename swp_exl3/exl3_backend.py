@@ -80,6 +80,7 @@ class Exl3Backend(Backend):
             max_num_tokens=cfg.cache_tokens, max_batch_size=1, max_history=cfg.max_history,
             recurrent_dtype=getattr(torch, {"half": "half", "float": "float", "bfloat16": "bfloat16"}[cfg.recurrent_dtype]))))
         self.rs, self.pos = None, 0
+        self._host_cache = {}                                    # (n, wire_dtype) -> pinned host buffer
         self.memory = {}
 
     # ------------------------------------------------------------------ lifecycle
@@ -183,10 +184,15 @@ class Exl3Backend(Backend):
         if not self.has_head:
             if tuple(y.shape) != (1, n) + self.tail:
                 raise RuntimeError(f"stage output shape {tuple(y.shape)} != expected {(1, n) + self.tail}")
-            if wire_dtype == "bf16":
-                body = y.to(t.bfloat16).contiguous().view(t.int16).cpu().numpy().tobytes()
-            else:
-                body = y.float().contiguous().cpu().numpy().tobytes()
+            dt = t.bfloat16 if wire_dtype == "bf16" else t.float32
+            key = (n, wire_dtype)
+            buf = self._host_cache.get(key)
+            if buf is None:
+                buf = t.empty((n,) + self.tail, dtype=dt, pin_memory=True)     # one pinned D2H per shape
+                self._host_cache = {key: buf}
+            src = y[0]
+            buf.copy_(src.to(dt) if src.dtype != dt else src)
+            body = buf.view(t.uint8).reshape(-1).numpy()                       # byte view, no extra copy
             timing["d2h_ms"] = (time.perf_counter() - t2) * 1e3
             return Result("hidden", body, wire_dtype, [n] + list(self.tail), timing)
 

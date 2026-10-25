@@ -38,19 +38,41 @@ def sample_topk(ids, vals, temperature=0.0, top_p=1.0, top_k=0, rng=None):
 
 class Pipeline:
     def __init__(self, stages, secret=None, wire_dtype="f32", chunk=512, contract=None, session="s1",
-                 node="coordinator", log=print):
+                 node="coordinator", log=print, stage_configs=None):
         self.stages = [s if isinstance(s, StageSpec) else StageSpec(*s) for s in stages]
         self.secret, self.wire, self.chunk, self.contract = secret, wire_dtype, chunk, contract
         self.session, self.node, self.log = session, node, log
         self.peers, self.history, self.step, self.tail = [], [], 0, None
+        self.stage_configs = (list(stage_configs or []) + [None] * len(self.stages))[:len(self.stages)]
+        self._local = {}                 # stage index -> LocalPeer, kept across reconnects (no reload)
         self.trace = Trace([tuple(s.layers) for s in self.stages])
 
     # ------------------------------------------------------------------ connection
+    def _make_local(self, i, path):
+        import os
+        from .config import load_stage
+        from .exl3_backend import Exl3Backend
+        from .server import StageServer, LocalPeer
+        c = load_stage(os.path.expanduser(path))
+        self.log(f"[local] stage {i}: loading layers {c.layers} from {c.model_dir}")
+        be = Exl3Backend(c, log=self.log)
+        be.load()
+        if c.warmup:
+            be.warmup(log=self.log)
+        return LocalPeer(StageServer(be, c.node, "local", secret=None, wire_dtypes=c.wire_dtypes,
+                                     max_chunk=c.max_chunk, log=self.log))
+
     def connect(self):
         self.close()
         n = len(self.stages)
         for i, s in enumerate(self.stages):
-            p = swp.Peer(s.addr, node=self.node, secret=self.secret)
+            if self.stage_configs[i]:
+                p = self._local.get(i)
+                if p is None:
+                    p = self._make_local(i, self.stage_configs[i])
+                    self._local[i] = p
+            else:
+                p = swp.Peer(s.addr, node=self.node, secret=self.secret)
             ready, _ = p.rpc(swp.STAGE_CONFIGURE, {
                 "session": self.session, "layers": list(s.layers), "has_embed": i == 0, "has_head": i == n - 1,
                 "wire_dtype": self.wire, **({"contract": self.contract} if self.contract else {})}, want=swp.STAGE_READY)
@@ -59,8 +81,10 @@ class Pipeline:
         self.history = []
 
     def close(self):
+        from .server import LocalPeer
         for p in self.peers:
-            p.close()
+            if not isinstance(p, LocalPeer):
+                p.close()
         self.peers = []
 
     def rtt_ms(self, n=50):

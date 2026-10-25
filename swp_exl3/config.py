@@ -52,6 +52,7 @@ class PipelineConfig:
     wire_dtype: str = "f32"
     chunk: int = 512
     topk: int = 64
+    stage_configs: list = field(default_factory=list)   # parallel to stages: local stage.toml path or None
 
     def secret(self):
         return _secret(self.secret_env, self.insecure)
@@ -88,7 +89,10 @@ def load_pipeline(path):
     p, st = d.get("pipeline") or {}, d.get("stage") or []
     if not st:
         raise ConfigError("no [[stage]] entries")
-    stages = [(s["addr"], _layers(s["layers"], f"[[stage]] {s.get('addr')}")) for s in st]
+    stages = [(s.get("addr") or "local", _layers(s["layers"], f"[[stage]] {s.get('addr')}")) for s in st]
+    for i, s in enumerate(st):
+        if not s.get("addr") and not s.get("stage_config"):
+            raise ConfigError(f"[[stage]] {i}: set addr (remote) or stage_config (in-process)")
     for (a0, (_, e0)), (a1, (s1, _)) in zip(stages, stages[1:]):
         if e0 != s1:
             raise ConfigError(f"stage layer ranges must be contiguous: {a0} ends at {e0} but {a1} starts at {s1}")
@@ -96,4 +100,5 @@ def load_pipeline(path):
         raise ConfigError("the first stage must start at layer 0")
     return PipelineConfig(stages=stages, model_dir=p.get("model_dir"), secret_env=p.get("secret_env"),
                           insecure=bool(p.get("insecure", False)), wire_dtype=p.get("wire_dtype", "f32"),
-                          chunk=int(p.get("chunk", 512)), topk=int(p.get("topk", 64)))
+                          chunk=int(p.get("chunk", 512)), topk=int(p.get("topk", 64)),
+                          stage_configs=[s.get("stage_config") for s in st])

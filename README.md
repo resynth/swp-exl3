@@ -273,6 +273,11 @@ topk        = 64                            # top-k kept when sampling
 addr   = "10.10.10.1:7801"
 layers = [0, 7]
 
+# alternative: run this stage inside the coordinator process (no socket hop) -----------------
+# [[stage]]
+# stage_config = "/models/stage-razer.toml"    # a normal [stage] file; loaded by the coordinator
+# layers       = [0, 7]
+
 [[stage]]
 addr   = "10.10.10.2:7802"
 layers = [7, 45]
@@ -280,6 +285,12 @@ layers = [7, 45]
 
 `[[stage]]` entries are in pipeline order; ranges must be **contiguous starting at 0**. Start the
 stages before `ping`/`generate`.
+
+An entry with `stage_config` instead of `addr` runs that stage **inside the coordinator process**:
+the coordinator loads the slice and calls the backend directly (no socket, no SWP framing). Use it
+for a stage on the coordinator's own machine, typically stage 0. Measured saving on this pair:
+~0.7–0.8 ms/token. Any coordinator command that connects (`ping`, `generate`, `smoke`, `logits`)
+loads such a stage, so it costs the same load time as a standalone stage.
 
 ### 3.3 Environment variables
 
@@ -366,3 +377,7 @@ Hybrid KDA linear attention (recurrent state) + MLA/DSA, MoE, **mHC hyper-connec
   cover them on real engines. Authentication is not encryption.
 * Every `generate` is a fresh process and pays a per-process kernel warmup on the first prefill; a
   long-lived coordinator would remove that.
+* Remote latency depends on the peer's CPU power state: after ~7 ms idle (the time the other stage
+  computes), a stage on a host with deep C-states enabled pays ~1.5 ms extra to receive the next
+  request. This is platform, not protocol; keep the host awake (performance governor / no deep idle)
+  for latency-critical stages. See `RESULTS.md` Task 4.

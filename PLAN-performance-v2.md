@@ -71,7 +71,7 @@ unless long prompts matter to you (ceiling 1.17x at this cut).
 - `doctor`: probe `modules/block_sparse_mlp_cpu` instead of `moe_cpu_host`; print the real offload knobs.
 - README: Kyojin 1.5.0 (not 1.6.0), 15 tests (1 skips without `SWP_WEIGHTD`), `PYTHONPATH` needed for Kyojin.
 - "Dependencies on this machine" note: exllamav3 `ext.py` `-std=c++20` patch (CUDA 13.3), stale `torch_extensions/.../lock`,
-  `ROCPROFILER_REGISTER_ENABLED=0`. Consider reporting the CUDA 13.3 build failure upstream.
+  `ROCPROFILER_REGISTER_ENABLED=0`. Consider reporting the CUDA 13.3 build failure upstream, don't do it, just report.
 - Repos: `splitwire` and `swp-exl3` stay separate; one canonical `swp.py`; `.gitignore`, licence, commit `Cargo.lock`, tag.
 - Reconnect/replay on real stages: one manual check (kill the Strix stage mid-generation, restart, confirm recovery). Not a suite.
 

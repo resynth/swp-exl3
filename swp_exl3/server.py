@@ -1,11 +1,29 @@
 """SWP/1 stage server: one loaded slice, one active session, any number of connections (calls are serialized)."""
-import socket, threading, time, traceback
+import os, socket, threading, time, traceback
 import numpy as np
 from . import swp
 from .backend import Unsupported
 from .contract import contract_hash, diff_contracts
 
 DTYPE_BYTES = {"f32": 4, "bf16": 2}
+
+
+class LocalPeer:
+    """In-process replacement for `swp.Peer`: calls the stage server directly (no socket, no framing)."""
+
+    def __init__(self, server, node="coordinator"):
+        self.server, self.node, self.seq, self.addr = server, node, 0, "local"
+
+    def rpc(self, kind, header, payload=b"", want=None):
+        self.seq += 1
+        frame = self.server.handle(kind, self.seq, header, payload)
+        return swp.expect(frame, want)
+
+    def ping(self, payload=b""):
+        return self.rpc(swp.PING, {}, payload, swp.PONG)
+
+    def close(self):
+        pass
 
 
 class StageServer:
@@ -16,6 +34,7 @@ class StageServer:
         self.session = None          # id of the configured session; None => must (re)configure
         self.wire = "f32"
         self.caps = ["stage", "topk"] + [f"wire:{d}" for d in self.wire_dtypes]
+        self.debug = bool(os.environ.get("SWP_DEBUG_TIMING"))
 
     # ---- lifecycle
     def bind(self):
@@ -50,11 +69,19 @@ class StageServer:
         try:
             swp.server_handshake(c, self.node, self.caps, self.secret)
             while True:
+                t0 = time.perf_counter()
                 kind, seq, h, payload = swp.recv_frame(c)
+                t1 = time.perf_counter()
                 try:
-                    self._dispatch(c, kind, seq, h, payload)
+                    out = self.handle(kind, seq, h, payload, t0, t1)
                 except swp.SwpError as e:
-                    swp.send_frame(c, swp.ERROR, seq, {"code": e.code, "message": e.message})
+                    out = (swp.ERROR, seq, {"code": e.code, "message": e.message}, b"")
+                t2 = time.perf_counter()
+                swp.send_frame(c, out[0], out[1], out[2], out[3])
+                if self.debug:
+                    t3 = time.perf_counter()
+                    self.log(f"[srv] kind={kind:#x} n={len(payload)}B recv={(t1-t0)*1e3:.3f} "
+                             f"handle={(t2-t1)*1e3:.3f} send={(t3-t2)*1e3:.3f}", flush=True)
         except (ConnectionError, OSError):
             pass
         except swp.SwpError as e:
@@ -64,24 +91,25 @@ class StageServer:
         finally:
             c.close()
 
-    def _dispatch(self, c, kind, seq, h, payload):
+    def handle(self, kind, seq, h, payload, t_recv_start=None, t_recv_done=None):
+        """Process one request and return (out_kind, seq, out_header, out_payload); raises swp.SwpError."""
         if kind == swp.PING:
-            return swp.send_frame(c, swp.PONG, seq, h, payload)
+            return swp.PONG, seq, h, payload
         with self.lock:
             if kind == swp.STAGE_CONFIGURE:
-                return self._configure(c, seq, h)
+                return self._configure(seq, h)
             if kind == swp.FORWARD:
-                return self._forward(c, seq, h, payload)
+                return self._forward(seq, h, payload, t_recv_start, t_recv_done)
             if kind == swp.CACHE_OP:
-                return self._cache_op(c, seq, h)
+                return self._cache_op(seq, h)
             if kind == swp.SESSION_CLOSE:
                 self.b.reset()
                 self.session = None
-                return swp.send_frame(c, swp.SESSION_CLOSED, seq, {"session": h.get("session")})
+                return swp.SESSION_CLOSED, seq, {"session": h.get("session")}, b""
         raise swp.SwpError("unsupported", f"kind {kind:#x}")
 
     # ---- handlers
-    def _configure(self, c, seq, h):
+    def _configure(self, seq, h):
         b = self.b
         want = (tuple(h.get("layers", ())), bool(h.get("has_embed")), bool(h.get("has_head")))
         have = (tuple(b.layers), b.has_embed, b.has_head)
@@ -97,10 +125,10 @@ class StageServer:
                 raise swp.SwpError("contract_mismatch", "; ".join(d))
         self.b.reset()
         self.session, self.wire = h.get("session", "s"), wd
-        swp.send_frame(c, swp.STAGE_READY, seq, {"session": self.session, "cache_len": 0, "tail": list(b.tail),
-                                                 "contract_hash": contract_hash(b.contract), "memory": getattr(b, "memory", {})})
+        return swp.STAGE_READY, seq, {"session": self.session, "cache_len": 0, "tail": list(b.tail),
+                                      "contract_hash": contract_hash(b.contract), "memory": getattr(b, "memory", {})}, b""
 
-    def _forward(self, c, seq, h, payload):
+    def _forward(self, seq, h, payload, t_recv_start=None, t_recv_done=None):
         b = self.b
         if self.session is None or h.get("session") != self.session:
             raise swp.SwpError("no_session", "configure the session first (stage may have been reset after an error)")
@@ -124,7 +152,7 @@ class StageServer:
             hidden = payload
         elif not b.has_embed:
             raise swp.SwpError("bad_request", "this stage has no embedding: send input=hidden")
-        t0 = time.perf_counter()
+        t_pre = time.perf_counter()
         try:
             res = b.forward(start, toks, hidden, self.wire, h.get("want", "token"), h.get("return_rows", "last"), h.get("k"))
         except Unsupported as e:
@@ -134,13 +162,17 @@ class StageServer:
             code = "out_of_memory" if "OutOfMemory" in type(e).__name__ else "engine_error"
             self.log(f"[{self.node}] forward failed: {traceback.format_exc()}")
             raise swp.SwpError(code, f"{type(e).__name__}: {e}")
-        wall = (time.perf_counter() - t0) * 1e3
+        wall = (time.perf_counter() - t_pre) * 1e3
         timing = dict(res.timing)
+        if t_recv_done is not None:
+            # srv_recv_ms includes the wait for the request, i.e. the time the other stage was computing.
+            timing["srv_recv_ms"] = (t_recv_done - t_recv_start) * 1e3
+            timing["srv_pre_ms"] = (t_pre - t_recv_done) * 1e3
         out = {"session": self.session, "step": h.get("step"), "kind": res.kind, "dtype": res.dtype, "shape": res.shape,
                "stage_ms": timing.get("compute_ms", wall), "timing": dict(timing, total_ms=wall)}
-        swp.send_frame(c, swp.FORWARD_OUT, seq, out, res.payload)
+        return swp.FORWARD_OUT, seq, out, res.payload
 
-    def _cache_op(self, c, seq, h):
+    def _cache_op(self, seq, h):
         op = h.get("op")
         try:
             if op == "truncate":
@@ -151,4 +183,4 @@ class StageServer:
                 raise swp.SwpError("unsupported", f"cache op {op}")
         except Unsupported as e:
             raise swp.SwpError("unsupported", str(e))
-        swp.send_frame(c, swp.CACHE_OK, seq, {"session": self.session, "cache_len": self.b.cache_len()})
+        return swp.CACHE_OK, seq, {"session": self.session, "cache_len": self.b.cache_len()}, b""
