@@ -86,6 +86,47 @@ noise), warm prefill is +6.5% (217.7 vs 204.4), and adapter/wire cost is **0.17 
 text matches the native run. The ~4.2 ms/token overhead in the two-machine pipeline is therefore
 the remote boundary transfer/queue, not the adapter itself.
 
+### MTP projection sidecar (Model A, 4-bit MTP)
+
+The sidecar question is now closed for Model A. Its `quantization_config.json` has
+**`mtp_bits = 4`**, not the 2 that older notes assumed. The larger sidecar gains reported
+elsewhere (+0.077 acceptance / +4.8% decode in the Kyojin note; +18% on the Yamz pack card) were
+measured with a 2-bit `eh_proj` (the Yamz pack itself has `mtp_bits = 2`), so they do not transfer
+to packs A/B.
+
+**Installed outside the packs**, at the shared default path Kyojin's server already probes:
+`/home/m/models/glm53-mtp-eh-proj-bf16.safetensors` (67,108,992 B = 64 MiB). Key
+`model.language_model.layers.45.eh_proj.weight`, shape `[4096, 8192]`, `bfloat16`, sha256
+`37ea317a0c60b328430905835869684b2fd8401c2d26a707471a03b0c1229015` (matches `SHA256SUMS` in
+`yamz-labs/GLM-5.3-Flash-EXL3-Yamz`; the file there is `mtp_eh_proj.st`, copied from the
+official release). No copy was put in either pack.
+
+Selection (Kyojin `apply_eh_sidecar_default` + engine `load_eh_proj_sidecar`): explicit
+`EXL3_MTP_EH_FP16=<file>` wins; unset -> `mtp_eh_proj.st` in the model folder, else the shared
+default above; `EXL3_MTP_EH_FP16=0` disables. All three cases were verified on the Strix.
+
+**Three arms**, native `tools/glm/serve.py`, Model A alone on the Strix, `--no-vision -c 8192`,
+`EXL3_SERVE_WARMUP=0`, one fixed 185-token prompt (186 with BOS), greedy, 200 new tokens. Each arm
+got a 200-token warm-up request with a different first token, then two measured runs.
+
+| arm | decode tok/s (server, 2 runs) | decode tok/s (client) | prefill tok/s | accepted / proposed | acceptance | rounds |
+|---|---|---|---|---|---|---|
+| MTP off (`--num-draft 0`) | 19.54 / 19.55 | 19.55 / 19.55 | 197 / 212 | — | — | — |
+| MTP on, `EXL3_MTP_EH_FP16=0` | 23.80 / 23.89 | 23.93 / 24.02 | 195 / 209 | 107 / 186 | 57.5% | 93 |
+| MTP on, sidecar | **23.99 / 24.07** | **24.13 / 24.20** | 190 / 204 | 108 / 184 | **58.7%** | 92 |
+
+* `g` = MTP on / off: **1.220** without the sidecar, **1.230** with it. The plan's `g >= 1.2`
+  gate passes either way.
+* Sidecar vs no sidecar: **+0.77% decode**, **+1.2 pp acceptance** (57.5 -> 58.7). Small,
+  deterministic on this prompt, and free; keep it.
+* Load: 111.6 GB torch-allocated in both MTP-on arms (the sidecar is 64 MiB); 105.8 GB MTP-off.
+  Prefill and load time are unchanged within noise.
+* This does not change the decision: MTP is the lever (~1.22x), the sidecar is a rounding error
+  at `mtp_bits = 4`. Model B was not measured alone (it still does not fit: 119 GiB vs 118 GiB
+  visible), but its MTP tensor is also 4-bit, so expect a similar small gain.
+* Raw `mtp_sidecar_results.json` and the three server logs are in
+  `/home/m/models/mtp_sidecar_bench/` on the Strix.
+
 ## Task 3 — stage warm-up
 
 Improvement for the **first prefill after a stage starts**, not for steady-state speed.
