@@ -203,9 +203,11 @@ from the stage sums because the DECODE line was not captured). Row 10 is the sam
 busy on the Strix (or right after sustained traffic) stage 1's overhead is 1.40–1.53 ms; after the
 package has been idle it is 2.8–3.1 ms — a reproducible ~1.5 ms wake penalty on every token. A busy
 core on the Razer does not remove it (2.82 ms); a busy core on the Strix does (1.40 ms). The Strix
-runs the `powersave` governor with `intel_idle` C1E/C6/C8/C10 enabled and no sudo in this session, so
-the platform setting was not changed. For a latency-critical stage, disable deep C-states (or keep
-one core busy) on the Strix; with a warm package, total decoder overhead is ~2.0 ms/token.
+(AMD Ryzen AI Max+ 395) runs `acpi_idle` under the `powersave` governor: POLL/C1/C2/C3, C3 latency
+**350 µs**, and C3 holds ~99.8% of idle residency. `/dev/cpu_dma_latency` is root-only there, and
+there was no sudo in this session, so no platform setting was changed. For a latency-critical stage,
+disable deep C-states (or keep one core busy) on the Strix; with a warm package, total decoder
+overhead is ~2.0 ms/token. `STRIX-IDLE-WAKE.md` covers the options, costs and verification.
 
 The final smoke (local stage 0, Strix back in its slow state) measured 15.47 tok/s with stage 0
 0.36 ms and stage 1 3.04 ms, showing the same bimodality.
