@@ -131,6 +131,13 @@ def cmd_generate(a):
             n, d = st["spec_rounds"], max(st["spec_drafted"], 1)
             print(f"spec: {n} rounds, {st['spec_accepted']}/{st['spec_drafted']} drafts accepted "
                   f"({100.0 * st['spec_accepted'] / d:.1f}%), k={min(a.spec_k, p.spec_k)}", file=sys.stderr)
+            if st.get("spec_mtp_drafts"):
+                print(f"spec timing: verify {st.get('spec_verify_ms', 0):.1f} ms, catch-up "
+                      f"{st.get('spec_catchup_ms', 0):.1f} ms, mtp roll {st.get('spec_roll_ms', 0):.1f} ms; "
+                      f"{st.get('spec_accepted_per_round', 0):.2f} accepted/round, "
+                      f"{st.get('spec_tokens_per_round', 0):.2f} tokens/round, "
+                      f"{st.get('spec_mtp_drafts', 0)} MTP drafts, "
+                      f"accepted/depth {st.get('spec_depth')}", file=sys.stderr)
         if a.json:
             json.dump(r, open(a.json, "w"), indent=1)
 

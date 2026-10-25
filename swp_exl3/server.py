@@ -34,6 +34,7 @@ class StageServer:
         self.session = None          # id of the configured session; None => must (re)configure
         self.wire = "f32"
         self.caps = ["stage", "topk"] + ([swp.CAP_SPEC] if getattr(backend, "supports_spec", False) else []) \
+            + ([swp.CAP_MTP] if getattr(backend, "supports_mtp", False) else []) \
             + [f"wire:{d}" for d in self.wire_dtypes]
         self.debug = bool(os.environ.get("SWP_DEBUG_TIMING"))
 
@@ -128,7 +129,8 @@ class StageServer:
         self.session, self.wire = h.get("session", "s"), wd
         return swp.STAGE_READY, seq, {"session": self.session, "cache_len": 0, "tail": list(b.tail),
                                       "contract_hash": contract_hash(b.contract), "memory": getattr(b, "memory", {}),
-                                      "spec": bool(getattr(b, "supports_spec", False)), "spec_k": int(getattr(b, "spec_k", 0))}, b""
+                                      "spec": bool(getattr(b, "supports_spec", False)), "spec_k": int(getattr(b, "spec_k", 0)),
+                                      "mtp": bool(getattr(b, "supports_mtp", False))}, b""
 
     def _forward(self, seq, h, payload, t_recv_start=None, t_recv_done=None):
         b = self.b
@@ -170,9 +172,14 @@ class StageServer:
             return_rows = "all" if h.get("want") in ("spec", "topk") else h.get("return_rows", "last")
         else:
             return_rows = h.get("return_rows", "last")
+        draft = None
+        if h.get("next_drafts") and swp.CAP_MTP in self.caps:
+            nk = len(spec["draft_ids"]) if spec is not None else int(h.get("draft_k") or 0)
+            draft = {"next_drafts": True, "k": nk, "sampling": h.get("sampling")}
         t_pre = time.perf_counter()
         try:
-            res = b.forward(start, toks, hidden, self.wire, h.get("want", "token"), return_rows, h.get("k"), spec=spec)
+            res = b.forward(start, toks, hidden, self.wire, h.get("want", "token"), return_rows, h.get("k"),
+                            spec=spec, draft=draft)
         except Unsupported as e:
             raise swp.SwpError("unsupported", str(e))
         except Exception as e:

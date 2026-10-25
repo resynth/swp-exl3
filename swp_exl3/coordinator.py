@@ -93,6 +93,8 @@ class Pipeline:
         self.session, self.node, self.log = session, node, log
         self.peers, self.history, self.step, self.tail = [], [], 0, None
         self.spec_k = 0                  # largest draft window every stage advertised (0 = no speculation)
+        self.head_mtp = False            # head stage can propose next-round drafts after a verify/decode
+        self.last_extra = {}             # head reply fields that are not the payload (drafts, basis, ...)
         self.stage_configs = (list(stage_configs or []) + [None] * len(self.stages))[:len(self.stages)]
         self._local = {}                 # stage index -> LocalPeer, kept across reconnects (no reload)
         self.trace = Trace([tuple(s.layers) for s in self.stages])
@@ -115,7 +117,7 @@ class Pipeline:
     def connect(self):
         self.close()
         n = len(self.stages)
-        spec_ks = []
+        spec_ks, head_ready = [], {}
         for i, s in enumerate(self.stages):
             if self.stage_configs[i]:
                 p = self._local.get(i)
@@ -129,8 +131,11 @@ class Pipeline:
                 "wire_dtype": self.wire, **({"contract": self.contract} if self.contract else {})}, want=swp.STAGE_READY)
             self.tail = ready.get("tail", self.tail)
             spec_ks.append(int(ready.get("spec_k", 0)))
+            if i == n - 1:
+                head_ready = ready
             self.peers.append(p)
         self.spec_k = min(spec_ks) if spec_ks else 0
+        self.head_mtp = bool(head_ready.get("mtp")) and self.spec_k > 0
         self.history = []
 
     def close(self):
@@ -174,9 +179,11 @@ class Pipeline:
                 hidden = payload
         return res
 
-    @staticmethod
-    def _parse_head(h, payload):
+    def _parse_head(self, h, payload):
         kind = h["kind"]
+        self.last_extra = {"drafts": [int(x) for x in (h.get("drafts") or [])],
+                           "drafts_basis": h.get("drafts_basis"),
+                           "timing": h.get("timing") or {}}
         if kind == "none":
             return ("none", None)
         if kind == "tokens":
@@ -184,7 +191,8 @@ class Pipeline:
         if kind == "spec":
             tokens = np.frombuffer(payload, "<i4").copy().tolist()
             return ("spec", {"accepted": int(h.get("accepted", max(len(tokens) - 1, 0))),
-                             "tokens": [int(x) for x in tokens], "drafts": [int(x) for x in (h.get("drafts") or [])]})
+                             "tokens": [int(x) for x in tokens], "drafts": list(self.last_extra["drafts"]),
+                             "drafts_basis": h.get("drafts_basis"), "timing": self.last_extra["timing"]})
         if kind == "topk":
             r, k = h["shape"]
             a = np.frombuffer(payload, "<i4", r * k).reshape(r, k).copy()
@@ -293,37 +301,64 @@ class Pipeline:
         return out[1][0][0], out[1][1][0]
 
     def _spec_loop(self, tok, want, top_k, max_new, temperature, top_p, stop_ids, spec, rng, on_token, pick):
-        """Speculative decode: propose k drafts, verify them in one k+1-row forward, emit the accepted prefix."""
+        """Speculative decode: propose k drafts, verify them in one k+1-row forward, emit the accepted prefix.
+        Drafts come from the head stage's MTP drafter when it supplies them, otherwise from the n-gram lookup."""
         k = max(0, min(int(spec.k), int(self.spec_k)))
-        gen = []
-        st = {"spec_rounds": 0, "spec_drafted": 0, "spec_accepted": 0}
+        gen, pending = [], []
+        st = {"spec_rounds": 0, "spec_drafted": 0, "spec_accepted": 0, "spec_mtp_drafts": 0,
+              "spec_verify_ms": 0.0, "spec_catchup_ms": 0.0, "spec_roll_ms": 0.0,
+              "spec_depth": [0] * max(k, 1)}
+        sampler = {"temperature": temperature, "top_p": top_p, "top_k": top_k, "seed": int(spec.seed or 0)}
         while len(gen) < max_new:
             gen.append(tok)
             if on_token:
                 on_token(tok)
             if tok in stop_ids or len(gen) >= max_new:
                 break
-            drafts = spec.propose(self.history + [tok], k)
+            # Prefer a known continuation (prompt lookup) over the drafter: it is free and, on
+            # repetitive output, exact. MTP is the fallback for novel text.
+            lookup = spec.propose(self.history + [tok], k)
+            if lookup:
+                drafts, pending = lookup[:k], []
+            else:
+                drafts = pending[:k]
+                pending = []
+            want_mtp = bool(self.head_mtp and want == "token" and not lookup)
             if not drafts:
-                out = self._relay_recover(len(self.history), [tok], want, "last", top_k, "decode", rewrite=True)
+                extra = None
+                if want_mtp:
+                    extra = {"next_drafts": True, "draft_k": k,
+                             "sampling": dict(sampler, round=st["spec_rounds"] + 1)}
+                out = self._relay_recover(len(self.history), [tok], want, "last", top_k, "decode",
+                                          rewrite=True, extra=extra)
                 self.history.append(tok)
                 tok = pick(out)
+                nxt = self.last_extra.get("drafts") or []
+                if nxt and self.last_extra.get("drafts_basis") == tok:
+                    pending = nxt[:k]
+                    st["spec_mtp_drafts"] += len(pending)
                 continue
             extra = {"mode": "verify", "draft_ids": drafts,
                      "accept": "argmax" if want == "token" else "sample",
-                     "sampling": {"temperature": temperature, "top_p": top_p, "top_k": top_k,
-                                  "seed": int(spec.seed or 0), "round": st["spec_rounds"] + 1},
-                     "next_drafts": False}
+                     "sampling": dict(sampler, round=st["spec_rounds"] + 1),
+                     "next_drafts": want_mtp}
+            t_round = time.perf_counter()
             kind, data = self._relay_recover(len(self.history), [tok] + drafts, "spec", "all", top_k, "decode",
                                              rewrite=True, extra=extra)
             if kind != "spec":
                 raise swp.SwpError("bad_reply", f"verify forward answered kind={kind}")
+            st["spec_verify_ms"] += (time.perf_counter() - t_round) * 1e3
             m, tokens = int(data["accepted"]), data["tokens"]
             if len(tokens) != m + 1:
                 raise swp.SwpError("bad_reply", f"spec reply has {len(tokens)} tokens for accepted={m}")
+            tm = data.get("timing") or {}
+            st["spec_catchup_ms"] += float(tm.get("catchup_ms", 0.0))
+            st["spec_roll_ms"] += float(tm.get("mtp_roll_ms", 0.0))
             st["spec_rounds"] += 1
             st["spec_drafted"] += len(drafts)
             st["spec_accepted"] += m
+            for j in range(len(drafts)):
+                st["spec_depth"][j] += 1 if j < m else 0
             self.history += [tok] + drafts[:m]          # committed; rejected rows are rewound lazily next round
             for t in tokens[:-1]:
                 if len(gen) >= max_new:
@@ -334,6 +369,10 @@ class Pipeline:
                 if t in stop_ids:
                     return gen, st
             tok = int(tokens[-1])                       # bonus: emitted at the top of the next round
+            nxt = data.get("drafts") or []
+            if nxt:
+                pending = nxt[:k]
+                st["spec_mtp_drafts"] += len(pending)
             if len(gen) >= max_new:
                 break
         return gen, st
@@ -356,6 +395,9 @@ class Pipeline:
         tok, t1 = pick(out), time.perf_counter()
         if spec is not None and self.spec_k > 0:
             gen, sst = self._spec_loop(tok, want, top_k, max_new, temperature, top_p, stop_ids, spec, rng, on_token, pick)
+            if sst.get("spec_rounds"):
+                sst["spec_accepted_per_round"] = sst["spec_accepted"] / sst["spec_rounds"]
+                sst["spec_tokens_per_round"] = 1.0 + sst["spec_accepted_per_round"]
         else:
             if spec is not None:
                 self.log("[pipeline] speculation requested but a stage advertises spec_k=0; plain decode")

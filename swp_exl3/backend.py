@@ -36,6 +36,7 @@ class Backend:
     recurrent: bool
     cache_tokens: int = 0
     supports_spec: bool = False
+    supports_mtp: bool = False
     spec_k: int = 0                # max draft window this stage can roll back (0 = no speculation)
 
     WARMUP_ROWS = (1, 1, 1, 16, 64, 256, 512)         # 3 decode steps, then 4 prefill sizes
@@ -43,11 +44,13 @@ class Backend:
     def load(self) -> dict: ...                       # returns memory info
     def reset(self): ...                              # new session / clear (frees recurrent state)
     def cache_len(self) -> int: ...
-    def forward(self, start_pos, token_ids, hidden, wire_dtype, want, return_rows, k, spec=None) -> Result:
+    def forward(self, start_pos, token_ids, hidden, wire_dtype, want, return_rows, k, spec=None, draft=None) -> Result:
         """`spec`, when not None, is a verify forward:
         {"draft_ids": [...], "accept": "argmax"|"sample", "sampling": {...}, "next_drafts": bool}.
         `want == "spec"` asks the head for acceptance (kind="spec"); `want == "topk"` is a verify
-        that returns logits for every row (used for the logit-equivalence check)."""
+        that returns logits for every row (used for the logit-equivalence check).
+        `draft`, when not None, asks the head stage to attach next-round drafts (MTP) to a normal
+        prefill/decode reply: {"next_drafts": bool, "k": int, "sampling": {...}}."""
     def truncate(self, pos): ...                      # may raise Unsupported
     def close(self): ...
 
@@ -109,13 +112,15 @@ class FakeBackend(Backend):
     supports_spec = True
 
     def __init__(self, layers, n_layers=8, hc=4, hidden=8, vocab=64, has_embed=None, has_head=None, recurrent=True,
-                 name="fake", delay_ms=0.0, fail_calls=(), spec_k=3, max_history=None):
+                 name="fake", delay_ms=0.0, fail_calls=(), spec_k=3, max_history=None, mtp_plan=None):
         self.layers = tuple(layers)
         self.n_layers, self.hc, self.hidden, self.vocab = n_layers, hc, hidden, vocab
         self.has_embed = layers[0] == 0 if has_embed is None else has_embed
         self.has_head = layers[1] == n_layers if has_head is None else has_head
         self.recurrent = recurrent
         self.spec_k, self.max_history = spec_k, spec_k if max_history is None else max_history
+        self.mtp_plan = mtp_plan
+        self.supports_mtp = mtp_plan is not None
         self.tail = (hc, hidden)
         self.contract = {"arch": "Fake", "n_layers": n_layers, "hidden_size": hidden, "vocab_size": vocab,
                          "hc_mult": hc, "boundary": {"tail": [hc, hidden], "canonical": "residual_pre_layer"}}
@@ -168,7 +173,7 @@ class FakeBackend(Backend):
             m = acc / np.float32(len(self.hist[li]))
         return row + np.float32(0.05 + 0.01 * g) * (m / (np.float32(1) + np.abs(m)))
 
-    def forward(self, start_pos, token_ids, hidden, wire_dtype, want, return_rows, k, spec=None):
+    def forward(self, start_pos, token_ids, hidden, wire_dtype, want, return_rows, k, spec=None, draft=None):
         import time
         self.calls += 1
         if self.calls in self.fail_calls:
@@ -211,10 +216,19 @@ class FakeBackend(Backend):
             while m < len(drafts) and pred[m] == drafts[m]:
                 m += 1
             tokens = drafts[:m] + [pred[m]]
-            extra = {"accepted": m, "tokens": tokens, "drafts": []}
+            nxt = []
+            if self.supports_mtp and draft and draft.get("next_drafts"):
+                nxt = [int(x) for x in (self.mtp_plan(start_pos + m + 2, int(draft.get("k") or 0)) or [])]
+            extra = {"accepted": m, "tokens": tokens, "drafts": nxt, "drafts_basis": int(tokens[-1])}
             return Result("spec", np.asarray(tokens, "<i4").tobytes(), "i32", [len(tokens)], extra=extra)
         if want == "token":
-            return Result("tokens", np.argmax(logits, -1).astype("<i4").tobytes(), "i32", [len(rows)])
+            ids = np.argmax(logits, -1).astype("<i4")
+            extra = {}
+            if self.supports_mtp and draft and draft.get("next_drafts"):
+                basis = int(ids[-1])
+                extra = {"drafts": [int(x) for x in (self.mtp_plan(start_pos + n + 1, int(draft.get("k") or 0)) or [])],
+                         "drafts_basis": basis}
+            return Result("tokens", ids.tobytes(), "i32", [len(rows)], extra=extra)
         kk = k or 8
         idx = np.argsort(-logits, axis=-1, kind="stable")[:, :kk].astype("<i4")
         val = np.take_along_axis(logits, idx, -1).astype("<f4")

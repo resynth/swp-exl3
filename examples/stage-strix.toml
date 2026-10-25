@@ -1,4 +1,4 @@
-# Strix Halo (Ubuntu Server 26.04, Kyojin 1.6.0, ROCm). EXAMPLE VALUES: take layers from `swp-plan`.
+# Strix Halo (Ubuntu Server 26.04, Kyojin 1.5.0, ROCm). EXAMPLE VALUES: take layers from `swp-plan`.
 # HIP presents as "cuda:0" in torch.
 [stage]
 node = "strix"
@@ -14,3 +14,5 @@ max_chunk = 512                      # rows per FORWARD (boundary row = hc_mult*
 wire_dtypes = ["f32", "bf16"]
 
 spec_k = 3                           # speculative draft window (verify rollback); 0 disables
+# mtp = true                         # head stage only: MTP drafter + read-only embedding copy (S3: no win here)
+# mtp_cache_tokens = 8192

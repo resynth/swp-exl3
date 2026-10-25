@@ -100,6 +100,29 @@ class T(unittest.TestCase):
         self.assertEqual(st["reused_prefix"], len(PROMPT) + len(out) - 1)
         self.assertEqual(got, newref)
 
+    def test_mtp_head_drafts_are_consumed_and_exact(self):
+        # The fake head returns the reference continuation as its "MTP" drafts; the coordinator must use
+        # them (including the off-by-one basis after a plain decode/verify) and stay byte-exact.
+        ref = reference([4], PROMPT, 16)
+
+        def plan(pos, k):
+            i = pos - len(PROMPT)
+            return ref[i:i + k] if 0 <= i < len(ref) else []
+
+        p, _ = pipe([4], mtp_plan=plan)
+        self.assertTrue(p.head_mtp)
+        got, st = p.generate(PROMPT, max_new=12, spec=SpecConfig(k=3, drafter=lambda c, k: []))
+        self.assertEqual(got, ref[:12])
+        self.assertGreater(st["spec_rounds"], 0)
+        self.assertGreater(st["spec_mtp_drafts"], 0)
+        self.assertEqual(st["spec_accepted"], st["spec_drafted"])
+
+    def test_mtp_off_falls_back_to_ngram(self):
+        p, _ = pipe([4])
+        self.assertFalse(p.head_mtp)
+        got, st = p.generate(PROMPT, max_new=10, spec=SpecConfig(k=3))
+        self.assertEqual(got, reference([4], PROMPT, 10))
+
     def test_ngram_drafts(self):
         self.assertEqual(ngram_drafts([1, 2, 3, 4, 1, 2, 3], 2, 3), [4, 1])
         self.assertEqual(ngram_drafts([1, 2, 3], 2, 2), [])
