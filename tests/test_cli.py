@@ -1,7 +1,26 @@
-import io, json, os, sys, tempfile, unittest, contextlib
+import io, json, os, sys, tempfile, types, unittest, contextlib
+import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.test_pipeline import start
 from swp_exl3 import cli, config
+
+
+class FakeTok:
+    """Minimal stand-in for exllamav3's Tokenizer, enough for smoke on the numpy fake backend."""
+    def __init__(self, vocab=64):
+        self.vocab = vocab
+        self.pieces = [f"<{i}>" for i in range(vocab)]
+        self.config = types.SimpleNamespace(eos_token_id_list=[vocab - 1])
+        self.eos_token_id = vocab - 1
+
+    def encode(self, text, encode_special_tokens=True):
+        return np.array([ord(c) % (self.vocab - 1) for c in text], dtype=np.int32)
+
+    def get_id_to_piece_list(self):
+        return self.pieces
+
+    def single_id(self, s):
+        raise ValueError(s)
 
 
 def run(args):
@@ -42,6 +61,32 @@ class T(unittest.TestCase):
         self.assertEqual(run(["logits", "--pipeline", p1, "--ids", ids, "--save", fa])[0], 0)
         self.assertEqual(run(["logits", "--pipeline", p2, "--ids", ids, "--save", fb])[0], 0)
         c, o, _ = run(["compare", fa, fb]); self.assertEqual(c, 0, o); self.assertIn("top-1 equal: True", o)
+
+    def test_smoke_golden_pass_fail_update(self):
+        d = tempfile.mkdtemp()
+        servers, specs = start([4])
+        p = toml(specs, d, "p.toml")
+        with open(p) as f:
+            t = f.read().replace("[pipeline]\n", '[pipeline]\nmodel_dir = "/fake"\n')
+        open(p, "w").write(t)
+        g = os.path.join(d, "golden.json")
+        old = cli._tokenizer
+        cli._tokenizer = lambda _: FakeTok()
+        try:
+            c, o, _ = run(["smoke", "--pipeline", p, "--no-contract", "--golden", g, "--update-golden"])
+            self.assertEqual(c, 0, o); self.assertIn("golden written", o); self.assertTrue(os.path.exists(g))
+            c, o, _ = run(["smoke", "--pipeline", p, "--no-contract", "--golden", g])
+            self.assertEqual(c, 0, o); self.assertIn("SMOKE PASS", o)
+            for s in servers:                       # perturb the model: smoke must fail
+                s.b.W[:] = np.roll(s.b.W, 1, axis=1)
+            c, o, _ = run(["smoke", "--pipeline", p, "--no-contract", "--golden", g])
+            self.assertNotEqual(c, 0, o); self.assertIn("SMOKE FAIL", o)
+            c, o, _ = run(["smoke", "--pipeline", p, "--no-contract", "--golden", g, "--update-golden"])
+            self.assertEqual(c, 0, o)
+            c, o, _ = run(["smoke", "--pipeline", p, "--no-contract", "--golden", g])
+            self.assertEqual(c, 0, o); self.assertIn("SMOKE PASS", o)
+        finally:
+            cli._tokenizer = old
 
     def test_config_validation(self):
         d = tempfile.mkdtemp()

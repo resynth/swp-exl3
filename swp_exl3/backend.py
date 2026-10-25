@@ -33,6 +33,9 @@ class Backend:
     has_embed: bool
     has_head: bool
     recurrent: bool
+    cache_tokens: int = 0
+
+    WARMUP_ROWS = (1, 1, 1, 16, 64, 256, 512)         # 3 decode steps, then 4 prefill sizes
 
     def load(self) -> dict: ...                       # returns memory info
     def reset(self): ...                              # new session / clear (frees recurrent state)
@@ -40,6 +43,29 @@ class Backend:
     def forward(self, start_pos, token_ids, hidden, wire_dtype, want, return_rows, k) -> Result: ...
     def truncate(self, pos): ...                      # may raise Unsupported
     def close(self): ...
+
+    def warmup(self, rows=None, log=None) -> dict:
+        """Run synthetic forwards so the first real prefill does not pay kernel/JIT warm-up, then reset.
+        Rows are cumulative so every forward also warms a different cache offset; non-first stages get
+        a zero boundary tensor (they have no embedding). Returns {"forwards", "ms", "per_forward_ms"}."""
+        import time
+        t0, start, done = time.perf_counter(), 0, []
+        for n in (rows or self.WARMUP_ROWS):
+            if self.cache_tokens and n > self.cache_tokens:
+                continue
+            if self.cache_tokens and start + n > self.cache_tokens:
+                self.reset()
+                start = 0
+            hidden = None if self.has_embed else b"\0" * (n * int(np.prod(self.tail)) * 4)
+            t = time.perf_counter()
+            self.forward(start, [1] * n, hidden, "f32", "token" if self.has_head else "none", "last", None)
+            start += n
+            done.append(round((time.perf_counter() - t) * 1e3, 1))
+        self.reset()
+        info = {"forwards": len(done), "ms": round((time.perf_counter() - t0) * 1e3, 1), "per_forward_ms": done}
+        if log:
+            log(f"[warmup] {info['forwards']} synthetic forwards in {info['ms']:.0f} ms ({done})")
+        return info
 
 
 # ---------------------------------------------------------------------------------------------- numpy fake

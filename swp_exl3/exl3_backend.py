@@ -59,6 +59,7 @@ class Exl3Backend(Backend):
         self.torch, self.cfg, self.log = torch, cfg, log
         a, b = cfg.layers
         self.layers, self.has_embed, self.has_head = (a, b), cfg.embed, cfg.head
+        self.cache_tokens = cfg.cache_tokens
         if cfg.cache_tokens % 256 or cfg.cache_tokens < 256:
             raise ValueError("cache_tokens must be a positive multiple of 256 (page size)")
         config = Config.from_directory(cfg.model_dir)
