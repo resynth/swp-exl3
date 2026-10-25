@@ -40,6 +40,26 @@ def run(model_dir=None, layers=None, first=False, last=False, out=print):
           lambda: [p for p in ("max_num_tokens", "max_batch_size", "max_history", "recurrent_dtype") if p not in inspect.signature(Cache.__init__).parameters] == [] or
           f"missing: {[p for p in ('max_num_tokens','max_batch_size','max_history','recurrent_dtype') if p not in inspect.signature(Cache.__init__).parameters]}")
     check("Cache.get_new_state (recurrent models)", lambda: hasattr(Cache, "get_new_state"))
+
+    def quant_cache():
+        q = getattr(ex, "CacheLayer_quant", None)
+        if q is None:
+            warn("quantized KV cache (cache_bits)", "no CacheLayer_quant in this engine (cache_bits = 0 only)")
+            return
+        cps = inspect.signature(Cache.__init__).parameters
+        qps = inspect.signature(q.__init__).parameters
+        has_var = any(p.kind == p.VAR_KEYWORD for p in cps.values())
+        missing = [p for p in ("layer_type",) if p not in cps]
+        missing += [p for p in ("k_bits", "v_bits") if p not in qps]
+        if not has_var:
+            missing += [p for p in ("k_bits", "v_bits") if p in qps and p not in cps]
+        missing = sorted(set(missing))
+        if missing:
+            warn("quantized KV cache (cache_bits)",
+                 f"Cache/CacheLayer_quant lacks {missing} (cache_bits = 0 only)")
+            return
+        check("quantized KV cache (cache_bits)", lambda: "CacheLayer_quant available (cache_bits = 8)")
+    quant_cache()
     check("load_gen(device=, progressbar=)", lambda: all(p in inspect.signature(Model.load_gen).parameters for p in ("device", "progressbar")))
     check("cache.recurrent_util.advance_recurrent_states", lambda: callable(importlib.import_module("exllamav3.cache.recurrent_util").advance_recurrent_states))
     hc = importlib.import_module("exllamav3.modules.hyperconnections")

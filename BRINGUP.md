@@ -312,8 +312,10 @@ becomes the Razer's **62 GB RAM** (~2.45 GB experts/layer → ~20 layers of expe
   never survived to a stage boundary here, so that code path is effectively untested on real HW.
   Worth a targeted test (a boundary after a site that defers).
 * **Prefill is not pipelined** and every CLI invocation pays per-process warmup.
-* **Context**: the Razer stage uses `cache_tokens = 8192` — that is the practical context cap for the
-  pair. The Strix has headroom; the 16 GB Razer does not.
+* **Context**: the Razer stage uses `cache_tokens = 8192` in this bring-up — that is a **config
+  choice**, not a hard cap. The checkpoint allows 1,048,576 positions. `RESULTS.md` T5 measures
+  128k-token prefill/decode and loads 576k fp16 / 768k q8 caches (q8 on the Strix only); the 8192
+  value is simply the small default used for the short-prompt benchmarks here.
 * **`swp-exl3` changes are uncommitted** (see §9). The exllamav3 `ext.py` fix lives in the dependency
   checkout.
 * The `doctor` "kyojin-style / older" info line is wrong (bad module probe) — harmless.
@@ -396,8 +398,10 @@ when the session ends — restart them with the commands above.
 * **Persistent coordinator.** Today every `generate` is a fresh process and eats seconds of kernel
   warmup on first prefill. A long-running coordinator (or a `serve` mode) would make prefill feel
   right and is probably the single biggest UX improvement.
-* **Cache sizing.** Razer `cache_tokens=8192` caps context. If you need long context, the split has
-  to give the Razer fewer layers, or move the cache-heavy layers to the Strix.
+* **Cache sizing.** `cache_tokens = 8192` was only a small default. Raise it for long context:
+  `RESULTS.md` T5 measures 128k prefill/decode, and the Strix loads 576k fp16 / 768k q8 caches at
+  this cut (q8 only on the Strix; it is slow on the Razer's CUDA build). Size for prompt + generation
+  + spec window and leave prefill-workspace headroom.
 * **Keep f32 on the wire.** bf16 saves ~30 µs/token of a ~50 ms token; not worth the accuracy.
 
 **Worth testing next.**

@@ -93,6 +93,9 @@ class Exl3Backend(Backend):
         self.cache_tokens = cfg.cache_tokens
         self.spec_k = int(getattr(cfg, "spec_k", 0) or 0)
         self.supports_spec = self.spec_k > 0
+        self.cache_bits_requested = int(getattr(cfg, "cache_bits", 0) or 0)
+        if self.cache_bits_requested not in (0, 8):
+            raise ValueError(f"cache_bits must be 0 (fp16 KV) or 8 (packed int8 KV), got {self.cache_bits_requested!r}")
         # A verify forward of k+1 rows records k rows of history. The engine sizes its conv rings and staged
         # scan inputs for max_history+1 rows, so k+1 columns is the safe setting (max_history >= k).
         self.max_history = max(int(cfg.max_history), self.spec_k + 1 if self.spec_k else 0)
@@ -110,13 +113,17 @@ class Exl3Backend(Backend):
         self.recurrent = self.slice.has_recurrent
         log(f"[slice] layers {a}..{b} blocks={self.slice.n_blocks} recurrent={self.recurrent} cache_layers={self.slice.n_cache_layers}")
         self._Cache, self._dtype_half = Cache, torch.half
-        if "recurrent_dtype" not in inspect.signature(Cache.__init__).parameters and cfg.recurrent_dtype != "half":
-            log(f"[warn] this exllamav3 build's Cache has no recurrent_dtype; ignoring recurrent_dtype={cfg.recurrent_dtype!r}")
         if self.max_history > int(cfg.max_history):
             log(f"[spec] max_history raised {cfg.max_history} -> {self.max_history} for k={self.spec_k} verify windows")
-        self.cache = Cache(self.model, **_filter_kwargs(Cache.__init__, dict(
-            max_num_tokens=cfg.cache_tokens, max_batch_size=1, max_history=self.max_history,
-            recurrent_dtype=getattr(torch, {"half": "half", "float": "float", "bfloat16": "bfloat16"}[cfg.recurrent_dtype]))))
+        cache_kwargs = dict(max_num_tokens=cfg.cache_tokens, max_batch_size=1, max_history=self.max_history,
+                            **self._quant_cache_kwargs(self.cache_bits_requested))
+        self.cache_bits = 8 if self.cache_bits_requested else 0
+        if "recurrent_dtype" in inspect.signature(Cache.__init__).parameters:
+            cache_kwargs["recurrent_dtype"] = getattr(
+                torch, {"half": "half", "float": "float", "bfloat16": "bfloat16"}[cfg.recurrent_dtype])
+        elif cfg.recurrent_dtype != "half":
+            log(f"[warn] this exllamav3 build's Cache has no recurrent_dtype; ignoring recurrent_dtype={cfg.recurrent_dtype!r}")
+        self.cache = Cache(self.model, **_filter_kwargs(Cache.__init__, cache_kwargs))
         self.rs, self.pos = None, 0
         self._last_was_verify, self._last_history = False, 0
         self._host_cache = {}                                    # (n, wire_dtype) -> pinned host buffer
@@ -141,8 +148,10 @@ class Exl3Backend(Backend):
         ct = int(self.cfg.mtp_cache_tokens or self.cfg.cache_tokens)
         if ct % 256 or ct < 256:
             raise ValueError("mtp_cache_tokens must be a positive multiple of 256 (page size)")
-        self.mtp_cache = self._Cache(self.mtp_model, **_filter_kwargs(self._Cache.__init__, dict(
-            max_num_tokens=ct, max_batch_size=1, max_history=0, recurrent_dtype=self.torch.half)))
+        mtp_kwargs = dict(max_num_tokens=ct, max_batch_size=1, max_history=0)
+        if "recurrent_dtype" in inspect.signature(self._Cache.__init__).parameters:
+            mtp_kwargs["recurrent_dtype"] = self.torch.half
+        self.mtp_cache = self._Cache(self.mtp_model, **_filter_kwargs(self._Cache.__init__, mtp_kwargs))
         keys = [k for k in mtp_cfg.stc.tensor_file_map if k.endswith(".embed_tokens.weight")]
         if len(keys) != 1:
             raise RuntimeError(f"MTP needs exactly one embed_tokens tensor in {d}; found {keys[:3]}")
@@ -156,6 +165,33 @@ class Exl3Backend(Backend):
         for k, v in (self.cfg.engine or {}).items():
             setattr(c.infer_params, k, v)
         return c
+
+    def _quant_cache_kwargs(self, bits):
+        """Build the quantized-KV cache kwargs, guarded by what this engine actually exposes.
+        `Cache(layer_type=CacheLayer_quant, k_bits=..., v_bits=...)` is optional, but an explicit
+        `cache_bits = 8` is not silently downgraded: a fallback would allocate the fp16 cache at the
+        q8-sized `cache_tokens` and can OOM. Fail with a clear message instead; use `cache_bits = 0`
+        on an engine without the packed cache."""
+        if not bits:
+            return {}
+        try:
+            from exllamav3 import Cache, CacheLayer_quant
+        except Exception as e:                                          # no quantized cache in this build
+            raise ValueError(f"cache_bits={bits} requested but this engine has no CacheLayer_quant; "
+                             f"set cache_bits = 0 on this engine") from e
+        cps = inspect.signature(Cache.__init__).parameters
+        qps = inspect.signature(CacheLayer_quant.__init__).parameters
+        has_var = any(p.kind == p.VAR_KEYWORD for p in cps.values())
+        missing = [p for p in ("layer_type",) if p not in cps]
+        missing += [p for p in ("k_bits", "v_bits") if p not in qps]
+        if not has_var:
+            missing += [p for p in ("k_bits", "v_bits") if p in qps and p not in cps]
+        missing = sorted(set(missing))
+        if missing:
+            raise ValueError(f"cache_bits={bits} requested but this engine's Cache/CacheLayer_quant "
+                             f"lacks {missing}; set cache_bits = 0 on this engine")
+        self.log(f"[cache] quantized KV: CacheLayer_quant k_bits={bits} v_bits={bits}")
+        return dict(layer_type=CacheLayer_quant, k_bits=bits, v_bits=bits)
 
     def _attach_mtp(self):
         """Attach the drafter to a shim that exposes the head slice's shared lm_head plus the embedding copy.
@@ -267,8 +303,16 @@ class Exl3Backend(Backend):
         t = self.torch
         if t.cuda.is_available():
             free, total = t.cuda.mem_get_info(self.cfg.device)
+            try:
+                cache_bytes = sum(l.storage_size() for l in self.cache.layers.values())
+                recurrent_bytes = sum(l.storage_size() for l in self.cache.recurrent_layers.values())
+            except Exception:
+                cache_bytes = recurrent_bytes = 0
             self.memory = {"device": str(self.cfg.device), "free_gb": round(free / 1e9, 2), "total_gb": round(total / 1e9, 2),
-                           "allocated_gb": round(t.cuda.memory_allocated(self.cfg.device) / 1e9, 2)}
+                           "allocated_gb": round(t.cuda.memory_allocated(self.cfg.device) / 1e9, 2),
+                           "cache_tokens": int(self.cfg.cache_tokens), "cache_bits": self.cache_bits,
+                           "cache_bits_requested": self.cache_bits_requested,
+                           "cache_gb": round(float(cache_bytes) / 1e9, 3), "recurrent_gb": round(float(recurrent_bytes) / 1e9, 3)}
         return self.memory
 
     def warmup(self, rows=None, log=None):
