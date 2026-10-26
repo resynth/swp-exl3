@@ -102,7 +102,8 @@ def kyojin_speed_env(kyojin_root):
     import ast
     path = os.path.join(os.path.expanduser(kyojin_root), "tools", "glm", "serve.py")
     try:
-        src = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
     except OSError as e:
         raise SystemExit(f"cannot read {path}: {e}")
     i = src.find("SPEED_ENV = {")
@@ -111,7 +112,10 @@ def kyojin_speed_env(kyojin_root):
     j = src.find("\n}\n", i)
     if j < 0:
         raise SystemExit(f"{path}: unterminated SPEED_ENV block")
-    d = ast.literal_eval(src[i + len("SPEED_ENV = "):j + 3])
+    try:
+        d = ast.literal_eval(src[i + len("SPEED_ENV = "):j + 3])
+    except (SyntaxError, ValueError) as e:
+        raise SystemExit(f"{path}: cannot parse SPEED_ENV block: {e}")
     if not isinstance(d, dict) or not all(isinstance(k, str) and isinstance(v, (str, int, float)) for k, v in d.items()):
         raise SystemExit(f"{path}: SPEED_ENV is not a flat str->scalar dict")
     return d
@@ -122,12 +126,13 @@ def cmd_speed_env(a):
     print(f"# {len(d)} flags from {os.path.expanduser(a.kyojin_root)}/tools/glm/serve.py")
     print("[stage.env]")
     for k, v in d.items():
-        print(f'{k} = "{v}"')
+        print(f"{k} = {json.dumps(str(v))}")
 
 
 def _dict_diff(where, t, l):
     return [f"  {where}.{k}: template={t.get(k)!r} live={l.get(k)!r}"
-            for k in sorted(set(t) | set(l)) if str(t.get(k)) != str(l.get(k))]
+            for k in sorted(set(t) | set(l))
+            if type(t.get(k)) is not type(l.get(k)) or t.get(k) != l.get(k)]
 
 
 def cmd_config_check(a):
@@ -145,7 +150,7 @@ def cmd_config_check(a):
             tv, lv = getattr(tpl, f.name), getattr(live, f.name)
             if isinstance(tv, dict) and isinstance(lv, dict):
                 rows += _dict_diff(f.name, tv, lv)
-            elif tv != lv:
+            elif type(tv) is not type(lv) or tv != lv:
                 rows.append(f"  {f.name}: template={tv!r} live={lv!r}")
         what = f"all fields except {', '.join(sorted(ignore))}"
     else:
@@ -252,6 +257,9 @@ def _smoke_generate(p, tok, text, max_new=48, topk=64):
 
 def cmd_smoke(a):
     """<90 s correctness gate: ping, two fixed greedy prompts vs golden, one top-64 logit check, one bench line."""
+    path = _golden_path(a)
+    if not a.update_golden and not os.path.exists(path):
+        raise SystemExit(f"{path}: no golden; create it with --update-golden on a known-good build")
     p, pc = _pipeline(a)
     if not pc.model_dir:
         raise SystemExit("smoke needs [pipeline] model_dir for the tokenizer")
@@ -301,13 +309,14 @@ def cmd_smoke(a):
     print(f"[first prefill] {st_first['prefill_tokens']} tok in {st_first['prefill_ms']:.0f} ms -> {ft:.1f} tok/s; "
           f"warm {st['prefill_ms']:.0f} ms -> {wt:.1f} tok/s; first/warm {ratio:.2f}x (target <= 1.20x)", file=sys.stderr)
 
-    path = _golden_path(a)
-    if a.update_golden or not os.path.exists(path):
-        json.dump(rec, open(path, "w"), indent=1)
+    if a.update_golden:
+        with open(path, "w") as f:
+            json.dump(rec, f, indent=1)
         print(f"golden written: {path}  (stages {rec['stages']}, wire {rec['wire_dtype']})")
         return 0
 
-    old = json.load(open(path))
+    with open(path) as f:
+        old = json.load(f)
     if old.get("version") != 1:
         raise SystemExit(f"{path}: unsupported golden version {old.get('version')!r}; re-create with --update-golden")
     if [x["prompt_ids"] for x in old["prompts"]] != [x["prompt_ids"] for x in rec["prompts"]]:
@@ -323,6 +332,8 @@ def cmd_smoke(a):
                 if x != y:
                     print(f"  first difference at token {i}: golden {x} ({o['text'][:80]!r}) vs now {y} ({n['text'][:80]!r})")
                     break
+    if old["logits"]["prompt_ids"] != rec["logits"]["prompt_ids"]:
+        raise SystemExit(f"{path}: logit prompt tokenization changed; re-create with --update-golden")
     r = _compare_logits(old["logits"], rec["logits"])
     lok = r["top1_equal"] and r["kl"] <= a.max_kl
     ok &= lok

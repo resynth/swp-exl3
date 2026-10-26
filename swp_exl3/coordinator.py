@@ -373,7 +373,7 @@ class Pipeline:
                     return gen, st
             tok = int(tokens[-1])                       # bonus: emitted at the top of the next round
             nxt = data.get("drafts") or []
-            if nxt:
+            if nxt and data.get("drafts_basis") == tok:
                 pending = nxt[:k]
                 st["spec_mtp_drafts"] += len(pending)
             if len(gen) >= max_new:

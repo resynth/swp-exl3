@@ -370,7 +370,7 @@ class Exl3Backend(Backend):
         self._last_was_verify, self._last_history = False, 0
 
     def truncate(self, pos):
-        if pos >= self.pos:
+        if pos > self.pos:
             return
         if pos <= 0:
             return self.reset()

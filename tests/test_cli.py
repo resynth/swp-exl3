@@ -1,4 +1,4 @@
-import io, json, os, sys, tempfile, types, unittest, contextlib
+import io, json, os, sys, tempfile, types, unittest, contextlib, tomllib
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.test_pipeline import start
@@ -73,6 +73,10 @@ class T(unittest.TestCase):
         old = cli._tokenizer
         cli._tokenizer = lambda _: FakeTok()
         try:
+            missing = os.path.join(d, "missing.json")
+            c, o, _ = run(["smoke", "--pipeline", p, "--no-contract", "--golden", missing])
+            self.assertNotEqual(c, 0)
+            self.assertFalse(os.path.exists(missing), "smoke must not create the golden implicitly")
             c, o, _ = run(["smoke", "--pipeline", p, "--no-contract", "--golden", g, "--update-golden"])
             self.assertEqual(c, 0, o); self.assertIn("golden written", o); self.assertTrue(os.path.exists(g))
             c, o, _ = run(["smoke", "--pipeline", p, "--no-contract", "--golden", g])
@@ -93,6 +97,8 @@ class T(unittest.TestCase):
         bad = os.path.join(d, "bad.toml")
         open(bad, "w").write('[pipeline]\ninsecure=true\n[[stage]]\naddr="a:1"\nlayers=[0,4]\n[[stage]]\naddr="b:1"\nlayers=[5,8]\n')
         with self.assertRaises(config.ConfigError): config.load_pipeline(bad)
+        open(bad, "w").write('[pipeline]\ninsecure=true\n[[stage]]\naddr="a:1"\nstage_config="a.toml"\nlayers=[0,4]\n')
+        with self.assertRaises(config.ConfigError): config.load_pipeline(bad)
         open(bad, "w").write('[pipeline]\n[[stage]]\naddr="a:1"\nlayers=[0,4]\n')
         pc = config.load_pipeline(bad)
         with self.assertRaises(config.ConfigError): pc.secret()          # neither secret_env nor insecure
@@ -109,6 +115,15 @@ class T(unittest.TestCase):
         self.assertIn('[stage.env]', o)
         self.assertIn('EXL3_A = "1"', o)
         self.assertIn('EXL3_B = "2048"', o)
+        open(os.path.join(d, "tools", "glm", "serve.py"), "w").write('SPEED_ENV = {\n    "EXL3_BARE": BARE_NAME,\n}\n')
+        c, _, _ = run(["speed-env", "--kyojin-root", d])
+        self.assertNotEqual(c, 0)
+        self.assertIn("cannot parse SPEED_ENV block", str(c))
+        tricky = 'a"b\\c\n'
+        open(os.path.join(d, "tools", "glm", "serve.py"), "w").write('SPEED_ENV = {\n    "EXL3_Q": %r,\n}\n' % tricky)
+        c, o, _ = run(["speed-env", "--kyojin-root", d])
+        self.assertEqual(c, 0, o)
+        self.assertEqual(tomllib.loads(o)["stage"]["env"]["EXL3_Q"], tricky)
         c, _, _ = run(["speed-env", "--kyojin-root", tempfile.mkdtemp()])
         self.assertNotEqual(c, 0)
 
@@ -132,6 +147,10 @@ class T(unittest.TestCase):
         c, o, _ = run(["config-check", "--config", live, "--template", tpl])
         self.assertEqual(c, 1)
         self.assertIn("EXL3_B", o)
+        open(live, "w").write(base.replace("moe_cpu_offload = 3", 'moe_cpu_offload = "3"'))
+        c, o, _ = run(["config-check", "--config", live, "--template", tpl])
+        self.assertEqual(c, 1)
+        self.assertIn("moe_cpu_offload", o)
         open(live, "w").write(base.replace("cache_tokens=16384", "cache_tokens=8192").replace("spec_k=8", "spec_k=4"))
         c, o, _ = run(["config-check", "--config", live, "--template", tpl, "--all"])
         self.assertEqual(c, 1)

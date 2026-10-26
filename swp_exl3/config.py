@@ -108,6 +108,8 @@ def load_pipeline(path):
     for i, s in enumerate(st):
         if not s.get("addr") and not s.get("stage_config"):
             raise ConfigError(f"[[stage]] {i}: set addr (remote) or stage_config (in-process)")
+        if s.get("addr") and s.get("stage_config"):
+            raise ConfigError(f"[[stage]] {i}: set either addr (remote) or stage_config (in-process), not both")
     for (a0, (_, e0)), (a1, (s1, _)) in zip(stages, stages[1:]):
         if e0 != s1:
             raise ConfigError(f"stage layer ranges must be contiguous: {a0} ends at {e0} but {a1} starts at {s1}")

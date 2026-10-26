@@ -192,7 +192,10 @@ class PipelineEngine:
         if loop_guard is not None:
             self._warn_once("loop_guard", "loop_guard is not implemented by this engine; ignoring it")
         loop = asyncio.get_running_loop()
-        ids = await loop.run_in_executor(None, (lambda: list(prompt_ids)) if prompt_ids is not None else (lambda: self._ids_for(prompt)))
+        ids = await loop.run_in_executor(
+            None,
+            (lambda: [int(t) for t in prompt_ids]) if prompt_ids is not None
+            else (lambda: self._ids_for(prompt)))
         # Admission in Kyojin's serve.py uses prompt_ids(); _ids_for can return more exact previous-reply ids,
         # so clamp now (and reject) against the ids actually fed, not only the re-tokenised length.
         room = self.ctx - len(ids) - 1 - self.num_draft

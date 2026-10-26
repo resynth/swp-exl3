@@ -203,6 +203,11 @@ class T(unittest.TestCase):
         want = "".join(ALPHA[t] for t in fresh_greedy(enc(prompt_of([{"role": "user", "content": "long"}])), 10, eos=()))
         self.assertEqual(content.strip(), want.strip())
 
+    def test_prompt_ids_stays_tensor_like(self):
+        ids = self.engine.prompt_ids("abc")
+        self.assertEqual(ids.numel(), 3)
+        self.assertEqual(ids.tolist(), enc("abc"))
+
     def test_unsupported_sampler_options_warn_once(self):
         logs = []
         self.engine.log = logs.append
