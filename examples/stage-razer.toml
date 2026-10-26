@@ -11,6 +11,7 @@ device = "cuda:0"
 cache_tokens = 16384
 max_chunk = 512
 wire_dtypes = ["f32", "bf16"]
+cache_bits = 0                       # 0 = fp16 KV cache; 8 = packed int8 KV (CacheLayer_quant, longer context)
 spec_k = 3                           # speculative draft window (verify rollback); 0 disables
 
 # Set on config.infer_params before the model is built (upstream 1.6.x CPU expert offload).

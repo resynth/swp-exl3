@@ -33,6 +33,7 @@ class StageConfig:
     secret_env: str = None
     insecure: bool = False
     recurrent_dtype: str = "half"
+    cache_bits: int = 0                             # 0 = fp16 KV cache, 8 = packed int8 KV cache (CacheLayer_quant)
     max_history: int = 0
     spec_k: int = 3                                 # speculative draft window; 0 disables the `spec` capability
     mtp: bool = False                               # load the MTP drafter + embedding copy on the head stage
@@ -80,6 +81,7 @@ def load_stage(path):
         cache_tokens=int(t.get("cache_tokens", 8192)), max_chunk=int(t.get("max_chunk", 512)),
         wire_dtypes=tuple(t.get("wire_dtypes", ("f32", "bf16"))), secret_env=t.get("secret_env"),
         insecure=bool(t.get("insecure", False)), recurrent_dtype=t.get("recurrent_dtype", "half"),
+        cache_bits=int(t.get("cache_bits", 0)),
         max_history=int(t.get("max_history", 0)), spec_k=int(t.get("spec_k", 3)),
         mtp=bool(t.get("mtp", False)), mtp_model_dir=t.get("mtp_model_dir"),
         mtp_cache_tokens=(int(t["mtp_cache_tokens"]) if t.get("mtp_cache_tokens") else None),
@@ -89,6 +91,8 @@ def load_stage(path):
         raise ConfigError("cache_tokens must be a multiple of 256")
     if c.mtp_cache_tokens is not None and c.mtp_cache_tokens % 256:
         raise ConfigError("mtp_cache_tokens must be a multiple of 256")
+    if c.cache_bits not in (0, 8):
+        raise ConfigError(f"cache_bits must be 0 (fp16) or 8 (packed int8), got {c.cache_bits!r}")
     if c.mtp and not c.head:
         raise ConfigError("[stage] mtp = true is only valid on the head stage (head = true)")
     return c

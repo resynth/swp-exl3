@@ -49,9 +49,12 @@ class T(unittest.TestCase):
             p, _ = pipe([3, 5], recurrent=rec)
             p.generate(PROMPT, max_new=6)
             alt = PROMPT[:7] + [50, 51, 52]
+            before = p.replayed_tokens
             self.assertEqual(p.rollback(7), how)
-            got = p.generate(alt, max_new=8)[0]
+            self.assertEqual(p.replayed_tokens - before, 7 if rec else 0)
+            got, st = p.generate(alt, max_new=8)
             self.assertEqual(got, self.ref(alt, 8, rec), rec)
+            self.assertEqual(st["replayed_tokens"], 0, "the prefix was already trimmed before generate()")
 
     def test_prefix_reuse_on_continuation(self):
         p, _ = pipe([4])
@@ -59,6 +62,7 @@ class T(unittest.TestCase):
         cont = PROMPT + out[:-1] + [7, 8]
         got, st = p.generate(cont, max_new=6)
         self.assertEqual(st["reused_prefix"], len(PROMPT) + len(out) - 1)
+        self.assertEqual(st["replayed_tokens"], 0)
         self.assertEqual(got, self.ref(cont, 6))
 
     def test_protocol_errors(self):
@@ -66,6 +70,11 @@ class T(unittest.TestCase):
         with self.assertRaises(swp.SwpError) as e:
             p.peers[0].rpc(swp.FORWARD, {"session": "s1", "start_pos": 5, "n_rows": 1, "token_ids": [1], "input": "tokens", "want": "hidden"}, want=swp.FORWARD_OUT)
         self.assertEqual(e.exception.code, "pos_mismatch")
+        servers[0].b.cache_tokens = 3
+        with self.assertRaises(swp.SwpError) as e:      # reserve room for the rows that will be written
+            p.peers[0].rpc(swp.FORWARD, {"session": "s1", "start_pos": 0, "n_rows": 4, "token_ids": [1, 2, 3, 4], "input": "tokens", "want": "hidden"}, want=swp.FORWARD_OUT)
+        self.assertEqual(e.exception.code, "context_exceeded")
+        servers[0].b.cache_tokens = 8192
         q = swp.Peer(p.stages[0].addr)
         with self.assertRaises(swp.SwpError) as e:
             q.rpc(swp.STAGE_CONFIGURE, {"session": "x", "layers": [0, 7], "has_embed": True, "has_head": False}, want=swp.STAGE_READY)
