@@ -318,6 +318,12 @@ becomes the Razer's **62 GB RAM** (~2.45 GB experts/layer → ~20 layers of expe
   value is simply the small default used for the short-prompt benchmarks here.
 * **`swp-exl3` changes are uncommitted** (see §9). The exllamav3 `ext.py` fix lives in the dependency
   checkout.
+* **Network exposure.** SWP authenticates (shared-secret challenge) but does not encrypt, and
+  `swp-kyojin-server` has no auth at all. Both hosts are on the internet, so the stage/weight
+  servers bind their Thunderbolt IPs (`10.10.10.1` / `10.10.10.2`) and the OpenAI endpoint binds
+  loopback. The `0.0.0.0` binds used during the original bring-up are not safe on an
+  internet-connected host; use the firewall recipe in `README.md` §9 (which also keeps the Razer's
+  BitTorrent TCP/UDP ports open).
 * The `doctor` "kyojin-style / older" info line is wrong (bad module probe) — harmless.
 
 ---
@@ -354,7 +360,7 @@ scp target/release/swp-{weightd,drive,plan,mockstage} m@10.10.10.2:/home/m/util/
 # --- Strix: weight server (only needed to (re)pull slices) ---
 ssh m@10.10.10.2 "set -a; . /home/m/swp/swp.env; set +a; \
   ~/util/swp-weightd serve --model /data/hf/hub/models--NicSir--GLM-5.3-Flash-EXL3-2.72bpw/snapshots/db672fc5e61f1d61bdf6d641fb63538b80bb7613 \
-  --listen 0.0.0.0:7700 --secret-env SWP_SECRET"
+  --listen 10.10.10.2:7700 --secret-env SWP_SECRET"   # Thunderbolt IP, not 0.0.0.0
 
 # --- Razer: pull this stage's slice ---
 export SWP_SECRET=$(cat /tmp/kilo/swp_secret)
@@ -380,7 +386,9 @@ swp-exl3 compare a.json b.json
 ```
 
 Note: the `swp-exl3` **stage servers currently run as session-scoped background processes** and stop
-when the session ends — restart them with the commands above.
+when the session ends — restart them with the commands above. The stage/weight listeners bind the
+Thunderbolt IPs (`10.10.10.1` / `10.10.10.2`), so bring the Thunderbolt link up first and keep the
+host firewalls as described in `README.md` §9.
 
 ---
 

@@ -1,5 +1,7 @@
-# Coordinator (runs next to the Strix stage). Stages in pipeline order; ranges must be contiguous from 0.
-# Copy to the coordinator machine and set model_dir + the [[stage]] addrs:
+# Coordinator. Stages in pipeline order; ranges must be contiguous from 0.
+# Copy to the coordinator machine and set model_dir + the [[stage]] addrs.
+# Addresses are the Thunderbolt endpoints; the stages bind only those interfaces (see the stage
+# files and README section 9), so a loopback address will NOT reach them:
 #   cp examples/pipeline.toml ~/models/pipeline.toml
 [pipeline]
 model_dir = "/models/GLM-5.3-Flash-exl3"     # machine-local: for tokenizer + contract check; optional
@@ -9,9 +11,9 @@ chunk = 2048                         # prefill rows per FORWARD; measured best o
 topk = 64
 
 [[stage]]
-addr = "razer-tb:7801"               # the Thunderbolt-network address of the Razer
+addr = "10.10.10.1:7801"             # the Thunderbolt-network address of the Razer
 layers = [0, 7]
 
 [[stage]]
-addr = "127.0.0.1:7802"
+addr = "10.10.10.2:7802"             # the Thunderbolt-network address of the Strix
 layers = [7, 45]

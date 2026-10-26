@@ -11,7 +11,10 @@ CUDA); see `BRINGUP.md` and `MEASUREMENTS.md` for a full run record and benchmar
   `smoke`, `logits`, `compare`, `speed-env`, `config-check`. It can also be run as `python -m swp_exl3 ...`.
 - Only `stage` is machine-local work (it loads a slice and serves it). The rest are coordinator-side.
 - Every network command needs a shared secret: put `secret_env = "SWP_SECRET"` in the config and
-  `export SWP_SECRET=...` on each machine, or set `insecure = true` on a trusted/direct link.
+  `export SWP_SECRET=...` on each machine. SWP authenticates with a keyed-hash challenge and does
+  **not** encrypt, so also keep the ports off the internet: bind a private interface (a direct
+  Thunderbolt link, a VPN address, or loopback) and firewall them (§9). `insecure = true` is only
+  for a direct cable or loopback, never an internet-connected host.
 
 ---
 
@@ -40,7 +43,7 @@ JIT-compile its CUDA/HIP extension on first use (minutes); if `import exllamav3`
 stale lock at `~/.cache/torch_extensions/*/<ext>/lock` (this torch blocks while the file exists).
 
 Verified on the reference pair: **exllamav3 1.6.4** (Razer, CUDA 13.3) and **Kyojin 1.5.0** (Strix,
-ROCm 7.13). Local suite: `python -m unittest discover -s tests` → **37 tests**, all pass with
+ROCm 7.13). Local suite: `python -m unittest discover -s tests` → **42 tests**, all pass with
 `SWP_WEIGHTD` set; 1 self-skips without it (the provisioning test). The Kyojin HTTP integration
 (`swp_exl3/integrations/kyojin-server/`) has a separate **9-test** no-GPU suite.
 
@@ -97,7 +100,7 @@ the count and contents are read from the installed checkout, not this repo). The
 as data, so nothing is imported, and prints a ready-to-paste table:
 
 ```bash
-swp-exl3 speed-env --kyojin-root /home/m/engines/kyojin
+swp-exl3 speed-env --kyojin-root <kyojin-path>
 # merge the printed [stage.env] into the stage file (or append it if the file has no [stage.env])
 ```
 
@@ -120,9 +123,9 @@ missing/extra/changed key. `--all` compares every field except the host-local on
 `listen`, `cache_tokens`, `mtp_cache_tokens`, plus anything in `--ignore`).
 
 ```bash
-cp examples/stage-strix.toml /home/m/swp/stage-strix.toml       # then set model_dir/listen/cache_tokens
-swp-exl3 config-check --config /home/m/swp/stage-strix.toml --template examples/stage-strix.toml
-# OK  /home/m/swp/stage-strix.toml matches examples/stage-strix.toml on [stage.env] and [stage.engine]
+cp examples/stage-strix.toml ~/stage-strix.toml       # then set model_dir/listen/cache_tokens
+swp-exl3 config-check --config ~/stage-strix.toml --template examples/stage-strix.toml
+# OK  ~/stage-strix.toml matches examples/stage-strix.toml on [stage.env] and [stage.engine]
 ```
 
 ### `swp-exl3 pull` — fetch one stage's tensors from a `swp-weightd`
@@ -143,7 +146,7 @@ swp-exl3 pull --server ADDR --out DIR --layers A B [--first | --last]
 
 ```bash
 export SWP_SECRET=...
-swp-exl3 pull --server 10.10.10.2:7700 --out /models/glm53-razer-slice \
+swp-exl3 pull --server <weights-host>:7700 --out /models/glm53-razer-slice \
   --layers 0 7 --first --secret-env SWP_SECRET
 ```
 
@@ -161,11 +164,11 @@ There are **no other flags**; everything comes from the config file (§3.1). Exa
 `examples/stage-razer.toml` and `examples/stage-strix.toml`.
 
 ```bash
-# Razer (stage 0)
+# first stage
 SWP_SECRET=... swp-exl3 stage --config examples/stage-razer.toml
-# Strix (stage 1), Kyojin on PYTHONPATH
-ssh strix "set -a; . /home/m/swp/swp.env; set +a; cd /path/to/kyojin && \
-  PYTHONPATH=$PWD exec ./.venv/bin/swp-exl3 stage --config stage-strix.toml"
+# last stage (Kyojin on PYTHONPATH)
+ssh <stage-host> "set -a; . /path/to/swp.env; set +a; cd /path/to/kyojin && \
+  PYTHONPATH=$PWD exec ./.venv/bin/swp-exl3 stage --config <stage-config.toml>"
 ```
 
 On start it prints `[slice] layers A..B blocks=… recurrent=… cache_layers=…`, then `memory: {...}`,
@@ -182,8 +185,8 @@ swp-exl3 ping --pipeline FILE [--no-contract]
 
 ```bash
 SWP_SECRET=... swp-exl3 ping --pipeline examples/pipeline.toml
-# 10.10.10.1:7801  layers 0..7   median RTT 16 us   (planner: "link_rtt_ms": 0.016)
-# 10.10.10.2:7802  layers 7..45  median RTT 130 us
+# 10.0.0.1:7801   layers 0..7   median RTT 16 us   (planner: "link_rtt_ms": 0.016)
+# 10.0.0.2:7802   layers 7..45  median RTT 130 us
 ```
 
 Also runs `STAGE_CONFIGURE`, so it validates the layer ranges, the wire dtype and the model contract.
@@ -263,8 +266,8 @@ and prints one `--bench` report. Warm run is about 20 s. The golden defaults to
 change must pass the same check. Exits non-zero on mismatch.
 
 ```bash
-SWP_SECRET=... swp-exl3 smoke --pipeline ~/models/pipeline-310-k7.toml --update-golden
-SWP_SECRET=... swp-exl3 smoke --pipeline ~/models/pipeline-310-k7.toml
+SWP_SECRET=... swp-exl3 smoke --pipeline examples/pipeline.toml --update-golden
+SWP_SECRET=... swp-exl3 smoke --pipeline examples/pipeline.toml
 ```
 
 ### `swp-kyojin-server` — persistent OpenAI-compatible coordinator
@@ -276,7 +279,7 @@ checkout (the Strix):
 
 ```bash
 python swp_kyojin_server.py --pipeline pipeline.toml --model-dir /models/GLM-5.3-Flash-exl3 \
-  --kyojin-root ~/engines/kyojin --ctx 8192 --host 0.0.0.0 --port 8000 [--spec]
+  --kyojin-root ~/engines/kyojin --ctx 8192 --host 127.0.0.1 --port 8000 [--spec]
 ```
 
 `--ctx` is the smallest stage `cache_tokens`. The server keeps history and reuses the longest common prefix, including
@@ -318,8 +321,8 @@ swp-exl3 compare a.json b.json
 ```toml
 [stage]
 node        = "razer"            # name shown in logs
-listen      = "0.0.0.0:7801"     # host:port to bind
-secret_env  = "SWP_SECRET"       # or: insecure = true
+listen      = "<private-ip>:7801"  # THIS host's private transport IP; never 0.0.0.0 on an internet host
+secret_env  = "SWP_SECRET"         # insecure = true is only for loopback / a direct cable
 model_dir   = "/models/glm53-razer-slice"
 layers      = [0, 7]             # [first, end) — must match the pipeline file
 embed       = true               # first stage: holds the embedding
@@ -361,7 +364,7 @@ chunk       = 512                           # prefill rows per FORWARD
 topk        = 64                            # top-k kept when sampling
 
 [[stage]]
-addr   = "10.10.10.1:7801"
+addr   = "<host-a-private-ip>:7801"
 layers = [0, 7]
 
 # alternative: run this stage inside the coordinator process (no socket hop) -----------------
@@ -370,7 +373,7 @@ layers = [0, 7]
 # layers       = [0, 7]
 
 [[stage]]
-addr   = "10.10.10.2:7802"
+addr   = "<host-b-private-ip>:7802"
 layers = [7, 45]
 ```
 
@@ -403,8 +406,9 @@ loads such a stage, so it costs the same load time as a standalone stage.
 # 0. both machines: install, doctor (§1)
 # 1. on the machine that HAS the weights, serve them (Rust)
 export SWP_SECRET=...
+# bind the weights host's private IP, not 0.0.0.0
 swp-weightd serve --model /data/hf/hub/models--turboderp--GLM-5.3-Flash-exl3/snapshots/<rev> \
-  --listen 0.0.0.0:7700 --secret-env SWP_SECRET
+  --listen <private-ip>:7700 --secret-env SWP_SECRET
 
 # 2. on the other machine, pull this stage's slice
 export SWP_SECRET=...
@@ -516,7 +520,8 @@ Hybrid KDA linear attention (recurrent state) + MLA/DSA, MoE, **mHC hyper-connec
 * Prefill uses `forward_ls` on every stage (no early-exit `prefill_ls` shortcut), so the last stage
   also runs the head on the final row of each chunk.
 * bf16 wire and `topk` output are implemented; the cut/offload equivalence checks in `MEASUREMENTS.md`
-  cover them on real engines. Authentication is not encryption.
+  cover them on real engines. Authentication is not encryption: SWP traffic is plaintext once the
+  handshake succeeds, so bind a private interface and firewall the ports (§9).
 * `cache_bits = 8` (packed int8 MLA/DSA pages) is opt-in and **not bit-identical**: it raises the Strix
   cache ceiling from 576k to 768–832k tokens, but greedy text drifts from the fp16 golden. It is also
   slow on the Razer's CUDA engine, so use it on the Strix only. `cache_bits = 0` remains the default.
@@ -550,3 +555,56 @@ them; check these first when a previously working pair fails to start.
   must export it itself.
 * **Kyojin is not pip-installed.** Run it from the checkout with the repo on `PYTHONPATH` (see §1);
   otherwise `swp-exl3 stage` cannot import the engine.
+
+---
+
+## 9. Network exposure and firewall
+
+The SWP transport authenticates with a shared-secret challenge but does **not** encrypt, and the
+OpenAI-compatible server (`swp-kyojin-server`) has no authentication or TLS. Treat both as private
+services and keep them off any internet-facing interface.
+
+### 9.1 Bind addresses
+
+| listener | bind to |
+|---|---|
+| `swp-exl3 stage` | the host's private transport address; port from `[stage].listen` |
+| `swp-weightd serve` | the weights host's private address; provisioning only |
+| `swp-kyojin-server` | `127.0.0.1` (no auth; use an SSH tunnel for remote clients) |
+
+Put each listener on the host's private transport address — a direct Thunderbolt link, a VPN
+address, or loopback — never `0.0.0.0` on a machine reachable from the internet. A stage bound to a
+private address cannot start while that link is down; that is the intended safe default.
+
+The payload is plaintext after the handshake: token ids and boundary tensors cross the private link
+in the clear. Keep that link point-to-point; do not bridge or route it over a shared network.
+
+### 9.2 Firewall
+
+Enable a default-deny inbound firewall and open only the SWP port on the private interface. If the
+host intentionally serves something else (for example a torrent client), open only that service's
+fixed port. The general shape, repeated on each stage host with that host's own interface, address
+and port:
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow in on <management-iface> to any port 22 proto tcp
+sudo ufw allow in on <private-iface> to <private-ip> port <stage-port> proto tcp
+sudo ufw enable
+sudo ufw status verbose
+```
+
+Open the weight-server port only while provisioning, then remove the rule. Keep deployment-specific
+addresses, ports and torrent rules in your own deployment notes, not in this file.
+
+### 9.3 Secrets
+
+- Keep the shared secret in a `0600` file and export it; do not put it on a command line. Both ends
+  must match.
+- The handshake never sends the secret (it sends a keyed hash), but there is no rate limit, so use a
+  high-entropy value. The secret is the only barrier if a port is accidentally exposed.
+- `SWP_SECRET` only authenticates the inference transport; it does not grant access to other host
+  files or services.
+- `swp-kyojin-server` has no API key and no TLS. Keep it on loopback and use an SSH tunnel for remote
+  clients.

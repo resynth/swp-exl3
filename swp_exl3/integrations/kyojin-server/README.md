@@ -8,7 +8,7 @@ only swp-exl3 change it needed was additive (`Pipeline.generate` now also report
 
 ## Run (on the Strix, in Kyojin's venv, with swp_exl3 installed there)
     python swp_kyojin_server.py --pipeline pipeline.toml --model-dir /models/GLM-5.3-Flash-exl3 \
-        --kyojin-root ~/engines/kyojin --ctx 8192 --host 0.0.0.0 --port 8000 [--spec]
+        --kyojin-root ~/engines/kyojin --ctx 8192 --host 127.0.0.1 --port 8000 [--spec]
 `--ctx` must be the SMALLEST stage `cache_tokens` (8192 in this example). For the measured long-context
 configs set both stages and `--ctx` to the same larger value; see `RESULTS.md` T5. Start the two stage servers first.
 Template: `--chat-template FILE`, else Kyojin's `tools/lanes/assets/glm53-template-medium.jinja`, else `<model>/chat_template.jinja`.
@@ -50,7 +50,9 @@ chat/completions supports streaming, stop, `max_tokens`/`max_completion_tokens`,
 `role: "tool"` follow-ups (verified non-stream and stream, `finish_reason: "tool_calls"`). Keep total prompt
 (system prompt + tool schemas + history) under the served `--ctx` (8192 in the example; see `RESULTS.md`
 T5 for the measured 128k/long-cache configs); over-context requests get a clean
-HTTP 400. One request at a time; no authentication or TLS (bind loopback or a trusted link).
+HTTP 400. One request at a time; no authentication or TLS. Keep the default `--host 127.0.0.1`
+and reach it remotely through an SSH tunnel (`ssh -L 8000:127.0.0.1:8000 m@host`); do **not**
+use `--host 0.0.0.0` on a machine that is on the internet.
 
 ## Not covered / limits
 * Verified against a Kyojin **1.5.0** checkout on the Strix (the 1.5.10 notes still apply). The module depends only on

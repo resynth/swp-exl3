@@ -5,8 +5,11 @@
 #   swp-exl3 config-check --config /home/m/swp/stage-strix.toml --template examples/stage-strix.toml
 [stage]
 node = "strix"
-listen = "0.0.0.0:7802"
-secret_env = "SWP_SECRET"            # export SWP_SECRET=... on every machine (or insecure = true on a direct cable)
+# Bind the Thunderbolt address, NOT 0.0.0.0: this host is on the internet, and SWP auth is
+# challenge-response only (not encryption). The stage is reachable only over the Thunderbolt cable
+# (or the local host); use an SSH tunnel if a client must reach it from elsewhere.
+listen = "10.10.10.2:7802"
+secret_env = "SWP_SECRET"            # export SWP_SECRET=... on every machine. Never use insecure = true on an internet-connected host.
 model_dir = "/models/GLM-5.3-Flash-exl3"     # machine-local: full model dir, or a slice dir made by `swp-exl3 pull`
 layers = [7, 45]                     # [first, end): must equal the pipeline file; the reference pair is
                                      # Razer [0, 7) + Strix [7, 45) for GLM-5.3-Flash (45 layers)

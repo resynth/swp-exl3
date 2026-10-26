@@ -5,7 +5,10 @@
 # Kyojin-only flags (SPEED_ENV, EXL3_VERIFY_ROW_SPLIT) do not apply here: upstream exllamav3 ignores them.
 [stage]
 node = "razer"
-listen = "0.0.0.0:7801"
+# Bind the Thunderbolt address, NOT 0.0.0.0: this host is on the internet, and SWP auth is
+# challenge-response only (not encryption). If the Thunderbolt link is down this address does not
+# exist and the server will fail to start; that is intentional.
+listen = "10.10.10.1:7801"
 secret_env = "SWP_SECRET"
 model_dir = "/models/glm53-razer-slice"      # machine-local: produced by: swp-exl3 pull --server strix:7700 ... --first
 layers = [0, 7]                              # [first, end): the reference pair is Razer [0, 7) + Strix [7, 45)
