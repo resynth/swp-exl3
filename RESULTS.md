@@ -12,6 +12,9 @@ adapter + wire + queue time per token.
 | 3 | Razer `EXL3_HC_FOLD=1`, first forward | 15.02 | 7.259 | 54.838 | 4.48 | 140.8 | PASS |
 | 4 | Razer `EXL3_HC_FOLD=1`, warm | 15.13 | 7.011 | 54.728 | 4.35 | 172.9 | PASS |
 | 5 | Task 3: stage warm-up on, fresh stages | 15.08 | 6.855 | 54.965 | 4.49 | 174.2 (first real prefill 176.6) | PASS |
+| 6 | Task 5 baseline, warm (in-session) | 15.05 | 7.181 | 54.794 | 4.47 | 172.1 | PASS |
+| 7 | Task 5: Strix `EXL3_BLOCK_GRAPH=1` | 15.05 | 6.758 | 55.255 | 4.48 | 168.1 | PASS |
+| 8 | Task 5: Strix `EXL3_BLOCK_GRAPH=1` + `EXL3_BLOCK_GRAPH_MLA=2` | 15.02 | 6.767 | 55.436 | 4.48 | 167.5 | PASS |
 
 All smoke runs: both 48-token prompts token-identical to the golden; top-64 logits top-1 equal,
 64/64 shared, **max |Δlogit| 0.00000, KL 0.00e+00**.
@@ -109,13 +112,115 @@ Improvement for the **first prefill after a stage starts**, not for steady-state
 * Unit tests: **21 tests, OK** (1 skips without `SWP_WEIGHTD`); new `tests/test_warmup.py` covers the
   prescribed rows, zero boundary tensors, reset/clean state, the small-cache guard, and config default.
 
+## Task 5 — engine env flags
+
+Rows 6–8 above. All three runs bit-identical to the golden (top-1 equal, 64/64 shared,
+max |Δlogit| 0.00000, KL 0.00e+00).
+
+* **`EXL3_HC_FOLD` — already answered; nothing new to test.** The flag exists *only* in the upstream
+  (Razer, CUDA) engine (`util/backend.py:56`); **Kyojin 1.5.0 has no `EXL3_HC_FOLD`** at all, so there
+  is no second engine or stage to try it on. It was tested on the Razer in Task 1 (rows 3–4:
+  15.13 vs 15.31 tok/s, stage0 7.011 vs 6.834 ms/tok) and is performance-neutral and bit-identical.
+  Left at `1` in the Razer `[stage.env]`.
+* **`EXL3_BLOCK_GRAPH=1`** (ROCm/Kyojin-only, `modules/block_graph.py`) is **neutral, marginally
+  negative** on the Strix: decode 15.05 vs 15.05 tok/s, stage1 55.255 vs 54.794 ms/tok. It is not
+  inert — a `EXL3_BLOCK_GRAPH_DEBUG=1` run shows **28 of the 38 layer-blocks capture and replay**
+  (layers 8,9,10,12,…,42,44 — every GDN+MoE block); the 10 attention layers (7,11,15,19,23,27,31,35,39,43
+  = `cache_layers=10`) decline. Capturing the majority of blocks changes decode by nothing, so **launch
+  overhead is not the Strix bottleneck** — its 38 layers are genuinely compute-bound (~1.44 ms/layer
+  against the Razer's ~1.09 ms/layer over 7 layers).
+* **`EXL3_BLOCK_GRAPH_MLA=2`** (the documented extension, capturing the MLA/DSA post-segments) captures
+  nothing extra here — the attention layers still decline — and is likewise neutral (15.02 tok/s).
+* **Kept: nothing.** Block graph stays off; `EXL3_HC_FOLD` unchanged.
+
+## Task 7 — prefill chunk size
+
+1576-token prompt (multi-chunk), Model B cut 7, f32, **warm** stages; two warm runs each, plus a
+3152-token robustness run at 2048.
+
+| chunk | warm prefill tok/s | stage0 prefill ms | stage1 prefill ms | first-run (cold) prefill | decode tok/s |
+|---|---|---|---|---|---|
+| 512 | 312.6 / 312.6 | 662–669 | 4145–4149 | 6479 ms | 14.2–14.4 |
+| 1024 | 397.8 / 398.7 | 577–581 | 3153–3161 | 4318 ms | 14.3–14.5 |
+| **2048** | **472.3 / 472.7** | 535–537 | 2575–2580 | 9123 ms | 14.2–14.4 |
+
+* Bigger chunks cut the **Strix's** prefill compute **38%** (4145 → 2575 ms); wall prefill goes
+  **313 → 399 → 473 tok/s**. Decode is unchanged (n=1, so `chunk` does not touch it) at ~14.4 tok/s.
+* Robustness: chunk 2048 handled a **3152-token** prompt (two full 2048-row chunks) with **no OOM** on
+  the Razer (3.18 GB free); warm 455 tok/s.
+* Caveat (first call only): the Task 3 stage warm-up covers rows ≤ 512, so the first real prefill at a
+  larger chunk pays a one-time shape autotune on the stage (1.5k prompt: 6.5 s at 512 → 9.1 s at 2048;
+  3.1k prompt at 2048: 19.1 s). Paid once per stage start; amortised for a long-lived stage.
+* **Kept: `chunk = 2048`** in `~/models/pipeline-310-k7.toml` (was 512). Requires `max_chunk ≥ 2048`
+  on both stages — set in `~/models/stage-310-razer-k7.toml` and `/home/m/swp/stage-310-strix-base.toml`.
+  The Task 1 golden is unaffected (all smoke prompts are a single chunk).
+
+## Task 4 — decode overhead (4.2–4.5 ms/token)
+
+Measured with the real pair, 20 decode tokens per run, `SWP_DEBUG_TIMING=1`, and a raw RPC probe
+that records each hop's timing dict (`/tmp/kilo/t4_probe.py`, not part of the repo).
+
+### Where the time actually is
+
+| stage | `prepare`+H2D | `forward_ls` (enqueue) | `advance` (incl. final sync) | D2H | RTT − compute |
+|---|---|---|---|---|---|
+| 0 (Razer, 7 layers) | 0.15–0.42 | 3.2–4.8 | 2.3–3.2 | 0.10–0.17 | **1.37** |
+| 1 (Strix, 38 layers) | 0.62 | 12.2 | 42.7 | 0.09 | **3.08** |
+
+* The plan's "anything outside `forward_ls` is adapter overhead" is **not** what the timings mean:
+  `forward_ls` only *enqueues* kernels. The real GPU wait is in the `cuda.synchronize()` at the end
+  of `advance`, so `advance_ms` (42.7 on the Strix) is the layer compute, not adapter overhead.
+  The adapter cost is `prepare`/H2D + D2H + framing; everything else is the two stages' compute.
+* Stage 0's 1.37 ms is loopback framing + prepare/D2H. Stage 1's 3.08 ms decomposes as
+  prepare+H2D 0.62 + D2H 0.09 + **~2.3 ms of delivery/wake**. A 64 KiB `PING` round trip is 0.354 ms,
+  so framing is not the cost.
+
+### Fixes
+
+* **(a) stage 0 in the coordinator process** — new `stage_config` key in `[[stage]]`; `LocalPeer`
+  calls `StageServer.handle()` directly, no socket/framing. Stage 0 wire+adapter drops
+  **1.35–1.60 → 0.36–0.73 ms**. `smoke` is bit-identical (top-1 equal, 64/64, Δlogit 0, KL 0).
+* **(b) one pinned D2H** — preallocated pinned staging buffer, byte view returned without
+  `.cpu().numpy().tobytes()` (one copy instead of three).
+* **(c) one `sendmsg` per frame** — header + payload as iovecs, short-write loop only as fallback.
+* (b) and (c) are neutral within run-to-run noise on this pair (the boundary is only 64 KiB), but
+  they remove copies and stay.
+* (d) was already done (argmax/top-k on the device; only ids cross the wire).
+
+### Result
+
+| # | change | decode tok/s | stage0 ms/tok | stage1 ms/tok | overhead ms/tok | smoke |
+|---|---|---|---|---|---|---|
+| 9 | Task 4 control: remote stage 0, one `sendmsg` + pinned D2H | ≈15.1 (20 tok) | 6.85 | 54.35 | 4.43 (1.35 + 3.18) | — |
+| 10 | Task 4: stage 0 in-process (`stage_config`) | 15.67 | 6.928 | 54.607 | **2.14** (0.61 + 1.53) | PASS |
+| 11 | Task 4: + Strix kept out of deep idle (external busy core) | 15.75 | 6.897 | 54.409 | **2.02** (0.57 + 1.44) | PASS |
+
+Rows 9–11: 149-token prompt, 48 greedy tokens except row 9 (20 tokens; its decode rate is derived
+from the stage sums because the DECODE line was not captured). Row 10 is the same
+`pipeline-310-k7-local.toml` as the final smoke: prefill 175.8 tok/s, first/warm 0.97x.
+
+**The remaining stage-1 cost is the Strix's idle power state, not the adapter.** With one core kept
+busy on the Strix (or right after sustained traffic) stage 1's overhead is 1.40–1.53 ms; after the
+package has been idle it is 2.8–3.1 ms — a reproducible ~1.5 ms wake penalty on every token. A busy
+core on the Razer does not remove it (2.82 ms); a busy core on the Strix does (1.40 ms). The Strix
+(AMD Ryzen AI Max+ 395) runs `acpi_idle` under the `powersave` governor: POLL/C1/C2/C3, C3 latency
+**350 µs**, and C3 holds ~99.8% of idle residency. `/dev/cpu_dma_latency` is root-only there, and
+there was no sudo in this session, so no platform setting was changed. For a latency-critical stage,
+disable deep C-states (or keep one core busy) on the Strix; with a warm package, total decoder
+overhead is ~2.0 ms/token. `STRIX-IDLE-WAKE.md` covers the options, costs and verification.
+
+The final smoke (local stage 0, Strix back in its slow state) measured 15.47 tok/s with stage 0
+0.36 ms and stage 1 3.04 ms, showing the same bimodality.
+
 ## Other findings
 
 * **First-forward warm-up is real even with kernels cached.** A freshly loaded Razer stage spent
   560.5 ms of compute on the first 149-token prefill vs 114.0 ms on the next run (stage 0 only;
   stage 1 was 727.8 vs 717.3 ms). This is the Task 3 target.
 * **Decode overhead is 4.2–4.5 ms/token** at this cut, matching the plan's ~4.6 ms; it is in the
-  adapter/wire, not in either stage's compute.
+  adapter/wire, not in either stage's compute. Task 4 splits it: ~0.7–0.8 ms is the remote stage-0
+  socket (removed by `stage_config`), ~0.7 ms is prepare/H2D/D2H, and the rest is the Strix's
+  idle-wake penalty (see Task 4; ~2.0 ms/token total with stage 0 in-process and the Strix awake).
 * Running Model A fully on the Strix via swp-exl3 uses **108.99 GB (17.53 GB free)**; MTP on adds
   ~5 GB (drafter + history) and leaves no room for the default 4608-token startup warm-up.
 

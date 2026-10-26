@@ -38,15 +38,24 @@ SMOKE_BENCH_PROMPT = (
 
 
 def _pipeline(args):
-    from .config import load_pipeline
+    from .config import load_pipeline, load_stage
     from .coordinator import Pipeline
     pc = load_pipeline(args.pipeline)
+    # A local stage lives in this process: its env must be in place before exllamav3 is first imported
+    # (the contract/tokenizer import below would otherwise freeze the defaults).
+    for path in pc.stage_configs:
+        if path:
+            for k, v in load_stage(os.path.expanduser(path)).env.items():
+                os.environ[k] = str(v)
+    os.environ.setdefault("EXL3_PF_HC_FUSE", "0")
+    os.environ.setdefault("EXL3_PF_GR_FUSE", "0")
     contract = None
     if pc.model_dir and not args.no_contract:
         from exllamav3 import Config
         from .contract import contract_from_config
         contract = contract_from_config(Config.from_directory(pc.model_dir))
-    p = Pipeline(pc.stages, secret=pc.secret(), wire_dtype=pc.wire_dtype, chunk=pc.chunk, contract=contract)
+    p = Pipeline(pc.stages, secret=pc.secret(), wire_dtype=pc.wire_dtype, chunk=pc.chunk, contract=contract,
+                 stage_configs=pc.stage_configs)
     p.connect()
     return p, pc
 

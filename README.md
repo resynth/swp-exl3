@@ -39,6 +39,10 @@ swp-exl3 doctor
 JIT-compile its CUDA/HIP extension on first use (minutes); if `import exllamav3` hangs, look for a
 stale lock at `~/.cache/torch_extensions/*/<ext>/lock` (this torch blocks while the file exists).
 
+Verified on the reference pair: **exllamav3 1.6.4** (Razer, CUDA 13.3) and **Kyojin 1.5.0** (Strix,
+ROCm 7.13). Local suite: `python -m unittest discover -s tests` → **22 tests**, all pass with
+`SWP_WEIGHTD` set; 1 self-skips without it (the provisioning test).
+
 > Kyojin is often *not* pip-installed — its `serve.py` works from the repo root. Run `swp-exl3`
 > with the engine repo on `PYTHONPATH`, e.g.
 > `PYTHONPATH=/path/to/kyojin /path/to/kyojin/.venv/bin/swp-exl3 stage --config ...`.
@@ -75,6 +79,11 @@ swp-exl3 doctor --model-dir /models/GLM-5.3-Flash-exl3 --layers 6 45 --last    #
 
 A dry run prints the architecture, `hc_mult`, the 64 KiB/row boundary size, the modules kept and the
 recurrent/cache layer counts. It loads **no weights**, so it is safe and fast.
+
+When the engine ships `exllamav3.modules.block_sparse_mlp_cpu`, `doctor` also reports the CPU expert
+offload knobs and their defaults (`moe_cpu_offload`, `moe_cpu_split`, `moe_cpu_threads`,
+`moe_cpu_pinned_arena`, `draft_moe_cpu_*`). An engine without that module gets a warning, not a
+failure, because not every build supports CPU offload.
 
 ### `swp-exl3 pull` — fetch one stage's tensors from a `swp-weightd`
 
@@ -273,6 +282,11 @@ topk        = 64                            # top-k kept when sampling
 addr   = "10.10.10.1:7801"
 layers = [0, 7]
 
+# alternative: run this stage inside the coordinator process (no socket hop) -----------------
+# [[stage]]
+# stage_config = "/models/stage-razer.toml"    # a normal [stage] file; loaded by the coordinator
+# layers       = [0, 7]
+
 [[stage]]
 addr   = "10.10.10.2:7802"
 layers = [7, 45]
@@ -280,6 +294,12 @@ layers = [7, 45]
 
 `[[stage]]` entries are in pipeline order; ranges must be **contiguous starting at 0**. Start the
 stages before `ping`/`generate`.
+
+An entry with `stage_config` instead of `addr` runs that stage **inside the coordinator process**:
+the coordinator loads the slice and calls the backend directly (no socket, no SWP framing). Use it
+for a stage on the coordinator's own machine, typically stage 0. Measured saving on this pair:
+~0.7–0.8 ms/token. Any coordinator command that connects (`ping`, `generate`, `smoke`, `logits`)
+loads such a stage, so it costs the same load time as a standalone stage.
 
 ### 3.3 Environment variables
 
@@ -366,3 +386,31 @@ Hybrid KDA linear attention (recurrent state) + MLA/DSA, MoE, **mHC hyper-connec
   cover them on real engines. Authentication is not encryption.
 * Every `generate` is a fresh process and pays a per-process kernel warmup on the first prefill; a
   long-lived coordinator would remove that.
+* Remote latency depends on the peer's CPU power state: after ~7 ms idle (the time the other stage
+  computes), a stage on a host with deep C-states enabled pays ~1.5 ms extra to receive the next
+  request. This is platform, not protocol; keep the host awake (performance governor / no deep idle)
+  for latency-critical stages. See `RESULTS.md` Task 4.
+
+---
+
+## 8. Dependencies on this machine
+
+Fixes applied to the *hosts*, not to this repo. Re-cloning or reinstalling the engine silently undoes
+them; check these first when a previously working pair fails to start.
+
+* **exllamav3 CUDA extension vs CUDA 13.x.** CUDA 13.3 `nvcc` cannot parse
+  `torch/include/ATen/core/List_inl.h` at `-std=c++17` (`need 'typename' before … difference_type`).
+  `-std=c++20` compiles it. Patch the compiler flags in `exllamav3/ext.py` (both `extra_cflags` and
+  `extra_cuda_cflags`) — this lives in the dependency checkout, so a re-clone loses it. Torch only
+  appends its own `-std=c++17` when the nvcc command has no `-std=` flag, so carrying `-std=c++20`
+  suppresses the override.
+* **Stale torch-extension build lock.** If `import exllamav3` hangs, delete
+  `~/.cache/torch_extensions/py<XY>_cu<NNN>/exllamav3_ext/lock`. This torch's `FileBaton` waits while
+  the lock file merely exists (`O_CREAT|O_EXCL`), so a lock left by an interrupted build blocks import
+  forever.
+* **ROCm idle spin (Strix).** `ROCPROFILER_REGISTER_ENABLED=0` must be set *before* torch is imported,
+  or an HSA profiler thread burns a full core for the process lifetime (measured: 210 → 0 jiffies per
+  2 s). `Exl3Backend.__init__` sets it before importing torch; anything else that imports torch first
+  must export it itself.
+* **Kyojin is not pip-installed.** Run it from the checkout with the repo on `PYTHONPATH` (see §1);
+  otherwise `swp-exl3 stage` cannot import the engine.
