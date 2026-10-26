@@ -34,6 +34,7 @@ class StageConfig:
     insecure: bool = False
     recurrent_dtype: str = "half"
     max_history: int = 0
+    warmup: bool = True                             # synthetic forwards after load() to remove first-prefill warm-up
     engine: dict = field(default_factory=dict)     # set on config.infer_params, e.g. moe_cpu_offload
     load: dict = field(default_factory=dict)       # extra kwargs for model.load()
     env: dict = field(default_factory=dict)        # environment variables set before importing exllamav3
@@ -74,8 +75,8 @@ def load_stage(path):
         cache_tokens=int(t.get("cache_tokens", 8192)), max_chunk=int(t.get("max_chunk", 512)),
         wire_dtypes=tuple(t.get("wire_dtypes", ("f32", "bf16"))), secret_env=t.get("secret_env"),
         insecure=bool(t.get("insecure", False)), recurrent_dtype=t.get("recurrent_dtype", "half"),
-        max_history=int(t.get("max_history", 0)), engine=dict(t.get("engine", {})), load=dict(t.get("load", {})),
-        env=dict(t.get("env", {})))
+        max_history=int(t.get("max_history", 0)), warmup=bool(t.get("warmup", True)),
+        engine=dict(t.get("engine", {})), load=dict(t.get("load", {})), env=dict(t.get("env", {})))
     if c.cache_tokens % 256:
         raise ConfigError("cache_tokens must be a multiple of 256")
     return c

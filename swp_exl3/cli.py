@@ -19,6 +19,24 @@ def glm_chat(prompt, system=None):
     return s + f"<|user|>\n{prompt}<|assistant|>\n"
 
 
+# smoke: fixed prompts, 48 greedy tokens each. Golden generated once from the known-good build.
+SMOKE_PROMPTS = [
+    ("capital", "The capital of France is"),
+    ("haiku", "Write a haiku about the sea."),
+]
+SMOKE_LOGIT_PROMPT = "The capital of France is"
+SMOKE_BENCH_PROMPT = (
+    "Explain how a decoder-only transformer language model generates text. Cover tokenization, the attention "
+    "mechanism, the feed-forward layers, and how sampling chooses the next token. Keep the explanation clear "
+    "and suitable for a software engineer who has not studied machine learning before. Use concrete examples "
+    "where they help. Then describe the main trade-offs between prefill speed and decode speed, why batching "
+    "helps prefill more than decode, and what speculative decoding changes. Finally, suppose the model is "
+    "split across two machines connected by a fast local link. Explain why per-token latency is roughly the "
+    "sum of the two stages, why a pipeline bubble appears during prefill, and why balancing layers between "
+    "the machines matters more for decode than for prefill. Finish with a short summary."
+)
+
+
 def _pipeline(args):
     from .config import load_pipeline
     from .coordinator import Pipeline
@@ -46,6 +64,8 @@ def cmd_stage(a):
     be = Exl3Backend(c)
     print(f"loading layers {c.layers} from {c.model_dir} ...", flush=True)
     print("memory:", be.load(), flush=True)
+    if c.warmup:
+        be.warmup(log=lambda s: print(s, flush=True))
     StageServer(be, c.node, c.listen, secret=c.secret(), wire_dtypes=c.wire_dtypes, max_chunk=c.max_chunk).serve_forever()
 
 
@@ -62,6 +82,16 @@ def cmd_ping(a):
         print(f"{s.addr}  layers {s.layers[0]}..{s.layers[1]}  median RTT {r*1e3:.0f} us   (planner: \"link_rtt_ms\": {r:.3f})")
 
 
+def _stop_ids(tok):
+    stops = set(getattr(tok.config, "eos_token_id_list", []) or [tok.eos_token_id])
+    for s in ("<|user|>", "<|endoftext|>", "<|observation|>"):
+        try:
+            stops.add(tok.single_id(s))
+        except Exception:
+            pass
+    return stops
+
+
 def cmd_generate(a):
     p, pc = _pipeline(a)
     tok = _tokenizer(pc.model_dir) if pc.model_dir else None
@@ -73,12 +103,7 @@ def cmd_generate(a):
     vocab, stops = None, set()
     if tok is not None:
         vocab = tok.get_id_to_piece_list()
-        stops = set(getattr(tok.config, "eos_token_id_list", []) or [tok.eos_token_id])
-        for s in ("<|user|>", "<|endoftext|>", "<|observation|>"):
-            try:
-                stops.add(tok.single_id(s))
-            except Exception:
-                pass
+        stops = _stop_ids(tok)
     stops |= {int(x) for x in (a.stop_id or [])}
     print(f"[prompt: {len(ids)} tokens]", file=sys.stderr)
     gen, st = p.generate(ids, a.max_new, a.temperature, a.top_p, pc.topk, stops, a.seed,
@@ -100,20 +125,106 @@ def cmd_logits(a):
     print(f"saved top-{a.k} logits for {len(ids)} prompt tokens to {a.save}  (cut points: {[s.layers for s in p.stages]})")
 
 
-def cmd_compare(a):
-    x, y = (json.load(open(f)) for f in (a.a, a.b))
-    assert x["prompt_ids"] == y["prompt_ids"], "different prompts"
+def _compare_logits(x, y):
+    """Compare two saved top-k logit records. KL is over the shared top-k, renormalised
+    (a proxy; full-vocab KL needs full logits)."""
     ia, va, ib, vb = np.array(x["ids"]), np.array(x["logits"]), np.array(y["ids"]), np.array(y["logits"])
     common = [i for i in ia if i in set(ib)]
     da = dict(zip(ia, va)); db = dict(zip(ib, vb))
     diffs = [abs(da[i] - db[i]) for i in common]
-    # KL over the shared top-k, renormalised (a proxy; full-vocab KL needs full logits)
     pa = np.exp(np.array([da[i] for i in common]) - max(da[i] for i in common)); pa /= pa.sum()
     pb = np.exp(np.array([db[i] for i in common]) - max(db[i] for i in common)); pb /= pb.sum()
     kl = float((pa * np.log(pa / pb)).sum())
+    return {"top1_equal": bool(ia[0] == ib[0]), "shared": len(common), "topk": len(ia),
+            "max_abs": float(max(diffs)), "kl": kl}
+
+
+def cmd_compare(a):
+    x, y = (json.load(open(f)) for f in (a.a, a.b))
+    assert x["prompt_ids"] == y["prompt_ids"], "different prompts"
+    r = _compare_logits(x, y)
     print(f"A cuts {x['stages']} wire={x['wire']}   B cuts {y['stages']} wire={y['wire']}")
-    print(f"top-1 equal: {ia[0] == ib[0]}   shared top-k ids: {len(common)}/{len(ia)}   max |dlogit|: {max(diffs):.5f}   KL(A||B) on shared top-k: {kl:.2e}")
-    return 0 if ia[0] == ib[0] and kl < a.max_kl else 1
+    print(f"top-1 equal: {r['top1_equal']}   shared top-k ids: {r['shared']}/{r['topk']}   max |dlogit|: {r['max_abs']:.5f}   KL(A||B) on shared top-k: {r['kl']:.2e}")
+    return 0 if r["top1_equal"] and r["kl"] < a.max_kl else 1
+
+
+def _golden_path(a):
+    return a.golden or os.path.splitext(a.pipeline)[0] + ".golden.json"
+
+
+def _smoke_generate(p, tok, text, max_new=48, topk=64):
+    ids = _encode(tok, text)
+    vocab = tok.get_id_to_piece_list()
+    gen, st = p.generate(ids, max_new, 0.0, 1.0, topk, _stop_ids(tok), None)
+    return {"prompt": text, "prompt_ids": ids, "tokens": [int(t) for t in gen],
+            "text": "".join(vocab[t] for t in gen)}, st
+
+
+def cmd_smoke(a):
+    """<90 s correctness gate: ping, two fixed greedy prompts vs golden, one top-64 logit check, one bench line."""
+    p, pc = _pipeline(a)
+    if not pc.model_dir:
+        raise SystemExit("smoke needs [pipeline] model_dir for the tokenizer")
+    tok = _tokenizer(pc.model_dir)
+    p.reset()                                  # same starting state for every run
+
+    print("[ping]", file=sys.stderr)
+    for s, r in zip(p.stages, p.rtt_ms(50)):
+        print(f"  {s.addr}  layers {s.layers[0]}..{s.layers[1]}  median RTT {r*1e3:.0f} us", file=sys.stderr)
+
+    rec = {"version": 1, "model_dir": pc.model_dir, "wire_dtype": pc.wire_dtype,
+           "stages": [list(s.layers) for s in p.stages], "prompts": [], "logits": None}
+    # First real prefill after the stage's synthetic warm-up; the same prompt is repeated warm at the end.
+    _, st_first = _smoke_generate(p, tok, SMOKE_BENCH_PROMPT, 48, pc.topk)
+    for name, text in SMOKE_PROMPTS:
+        g, _ = _smoke_generate(p, tok, text, 48, pc.topk)
+        g["name"] = name
+        rec["prompts"].append(g)
+        print(f"[gen] {name}: {json.dumps(g['text'])[:160]}", file=sys.stderr)
+
+    lid = _encode(tok, SMOKE_LOGIT_PROMPT)
+    ti, tv = p.logits_topk(lid, 64)
+    rec["logits"] = {"prompt": SMOKE_LOGIT_PROMPT, "prompt_ids": lid,
+                     "ids": ti.tolist(), "logits": tv.tolist()}
+
+    g, st = _smoke_generate(p, tok, SMOKE_BENCH_PROMPT, 48, pc.topk)
+    print(f"[bench prompt] {len(g['prompt_ids'])} tokens", file=sys.stderr)
+    p.report(st, out=lambda s: print(s, file=sys.stderr))
+    ft = st_first["prefill_tokens"] * 1e3 / max(st_first["prefill_ms"], 1e-9)
+    wt = st["prefill_tokens"] * 1e3 / max(st["prefill_ms"], 1e-9)
+    ratio = st_first["prefill_ms"] / max(st["prefill_ms"], 1e-9)
+    print(f"[first prefill] {st_first['prefill_tokens']} tok in {st_first['prefill_ms']:.0f} ms -> {ft:.1f} tok/s; "
+          f"warm {st['prefill_ms']:.0f} ms -> {wt:.1f} tok/s; first/warm {ratio:.2f}x (target <= 1.20x)", file=sys.stderr)
+
+    path = _golden_path(a)
+    if a.update_golden or not os.path.exists(path):
+        json.dump(rec, open(path, "w"), indent=1)
+        print(f"golden written: {path}  (stages {rec['stages']}, wire {rec['wire_dtype']})")
+        return 0
+
+    old = json.load(open(path))
+    if old.get("version") != 1:
+        raise SystemExit(f"{path}: unsupported golden version {old.get('version')!r}; re-create with --update-golden")
+    if [x["prompt_ids"] for x in old["prompts"]] != [x["prompt_ids"] for x in rec["prompts"]]:
+        raise SystemExit(f"{path}: prompts/tokenizer changed; re-create with --update-golden")
+
+    ok = True
+    for o, n in zip(old["prompts"], rec["prompts"]):
+        same = o["tokens"] == n["tokens"]
+        ok &= same
+        print(f"prompt {n['name']:<8} {'ok' if same else 'MISMATCH'}  {len(n['tokens'])} tokens")
+        if not same:
+            for i, (x, y) in enumerate(zip(o["tokens"], n["tokens"])):
+                if x != y:
+                    print(f"  first difference at token {i}: golden {x} ({o['text'][:80]!r}) vs now {y} ({n['text'][:80]!r})")
+                    break
+    r = _compare_logits(old["logits"], rec["logits"])
+    lok = r["top1_equal"] and r["kl"] <= a.max_kl
+    ok &= lok
+    print(f"logits   {'ok' if lok else 'FAIL'}  top-1 equal: {r['top1_equal']}  shared {r['shared']}/{r['topk']}  "
+          f"max |dlogit|: {r['max_abs']:.5f}  KL: {r['kl']:.2e} (max {a.max_kl:.0e})")
+    print("SMOKE", "PASS" if ok else "FAIL", f"(golden {path})")
+    return 0 if ok else 1
 
 
 def main(argv=None):
@@ -141,6 +252,12 @@ def main(argv=None):
     s.add_argument("--max-new", type=int, default=128); s.add_argument("--temperature", type=float, default=0.0); s.add_argument("--top-p", type=float, default=1.0)
     s.add_argument("--seed", type=int); s.add_argument("--stop-id", action="append"); s.add_argument("--bench", action="store_true"); s.add_argument("--json")
     s.set_defaults(fn=cmd_generate)
+
+    s = sp.add_parser("smoke", help="<90 s correctness gate: ping, two greedy prompts, top-k logits, one bench"); pl(s)
+    s.add_argument("--update-golden", action="store_true", help="(re)write the golden from this run")
+    s.add_argument("--golden", help="golden JSON path (default: <pipeline>.golden.json)")
+    s.add_argument("--max-kl", type=float, default=1e-4, help="max KL on the shared top-64 (default 1e-4)")
+    s.set_defaults(fn=cmd_smoke)
 
     s = sp.add_parser("logits", help="save top-k logits for a prompt (cut-invariance check, step 1)"); pl(s)
     s.add_argument("--prompt"); s.add_argument("--ids"); s.add_argument("--k", type=int, default=64); s.add_argument("--save", required=True); s.set_defaults(fn=cmd_logits)
