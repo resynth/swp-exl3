@@ -636,3 +636,70 @@ control) and `pipeline-310-k7-q8.toml`.
   `src/msg.rs` (`CAP_SPEC` only; `CAP_MTP` is Python-side because it changes no wire framing).
 * Stage configs: `spec_k = 4` and `cache_tokens = 8192` on the Strix for the S3 sweep; `mtp`
   defaults to false. `spec_k = 0` in `[stage]` disables the `spec` capability entirely.
+
+## Post-v2 levers (T4/T6): prefill fusions, verify `ROW_SPLIT`, rows curve
+
+Environment: Model B, Razer `[0,7)` + Strix `[7,45)`, f32 wire, chunk 2048, Kyojin 1.5.0 with Task A's
+`SPEED_ENV`, `EXL3_PF_HC_FUSE=1`, `EXL3_PF_GR_FUSE=0`, `spec_k=8` on both stages.
+
+### T4 — prefill fusions the adapter forces off (stage-only Strix, 3-run median, chunk 2048)
+
+| HC_FUSE | GR_FUSE | 1,576 rows | 3,152 rows |
+|---|---|---|---|
+| 0 | 0 | 2,101.5 ms (750 tok/s) | 4,507.9 ms (699 tok/s) |
+| 0 | 1 | 2,053.2 ms (768) | 4,454.9 ms (708) |
+| 1 | 0 | 2,013.7 ms (783) | 4,441.2 ms (710) |
+| 1 | 1 | 2,014.0 ms (783) | 4,430.5 ms (711) |
+
+`HC_FUSE=1` is **+4.4%** at 1.5k (gate +3%); `GR_FUSE=1` alone is only +2.3% (below gate) and adds
+nothing on top of `HC_FUSE=1` (2,014.0 vs 2,013.7 ms). Keep `HC_FUSE=1`, `GR_FUSE=0` — i.e. no change
+from Task A. Note `EXL3_PF_GR_FUSE` is **not** in Kyojin's GLM `SPEED_ENV` (it is set by the Qwen
+server); `EXL3_GR_PF_FUSE` defaults to `1` and the deferred fold is gated only on `EXL3_PF_GR_FUSE=1`.
+
+### T6 — verify rows curve on the real pair (42-token repetitive prompt, 100% acceptance, spec_k=8)
+
+verify ms/round (3-run median), B = verify rows = k+1:
+
+| ROW_SPLIT | B=2 | B=3 | B=4 | B=5 | B=6 | B=7 | B=8 | B=9 |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 113.3 | 137.6 | 159.1 | 178.8 | **261.8** | **292.1** | 235.3\* | 270.0 |
+| 1 | 112.7 | 134.6 | 158.5 | 182.9 | 207.7 | 226.2 | 246.1 | 279.9 |
+| 2 | 113.1 | 139.7 | 158.4 | 183.1 | **201.4** | **222.0** | 242.4 | 274.6 |
+
+\* the `ROW_SPLIT=0` B=8 point is not monotone (small round count); the `=1/=2` curves are smooth
+(~+20–24 ms/row).
+
+* Rows 2–5 reproduce the Task A curve within noise, so raising `max_history` to 9 does not change them.
+* Without `ROW_SPLIT`, B≥6 hits the engine's >4-row slow path (+83 ms at B=6, +113 at B=7).
+  `EXL3_VERIFY_ROW_SPLIT=2` (split only the MoE; GEMV/hc take 5–8 rows natively) removes it:
+  **−23% at B=6, −24% at B=7**, curve linear to B=9. `=1` is close; `=2` chosen (best at 6/7, ties 8/9).
+* Correctness at 9 rows: `spec_check` k=8 top-1 equal, 0 mismatches, KL 9.7e-3 (the known batched-kernel
+  floor); greedy k=8 output identical to plain; `smoke` PASS.
+* No prefill effect: stage-only 1,576/3,152 rows with `ROW_SPLIT=2` = 2,001.8 / 4,401.2 ms.
+
+### Result — final flags (`HC_FUSE=1`, `GR_FUSE=0`, `ROW_SPLIT=2`, `spec_k=8` both stages)
+
+| run | decode |
+|---|---|
+| plain, 149-token prompt | 15.02 tok/s |
+| spec k=3 (previous default window) | 23.96 tok/s |
+| spec k=4 | 26.50 tok/s |
+| **spec k=8** | **32.15 tok/s** (2.14× plain, identical text, 7 rounds) |
+
+Prefill 1,576 warm 485.6 tok/s; `smoke` PASS.
+
+### T7 / T9
+
+* **T7 (concurrent-stream batching) dropped**: it only amortises the per-*forward* weight sweep across
+  concurrent sequences, so it does nothing for one prompt at a time; the adapter is also single-session
+  per stage (`batch_shape (1, cache_tokens)`).
+* **T9 (per-module GPU timing) skipped**: diagnostic only (deciding whether to report an upstream
+  fusion), no user-facing gain.
+
+### Files
+
+* Strix `/home/m/swp/stage-310-strix-k7-f16.toml` and `stage-310-strix-base.toml`: `spec_k = 8`,
+  `EXL3_VERIFY_ROW_SPLIT = "2"` (backups `.bak-t4t6`).
+* Razer `~/models/stage-310-razer-k7.toml` and `-f16.toml`: `spec_k = 8` (backups `.bak-t4t6`).
+* Measurement configs: `~/models/pipeline-310-k7-local-rows.toml`,
+  `~/models/stage-310-razer-k7-f16-sk8.toml`.

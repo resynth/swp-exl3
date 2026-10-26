@@ -97,6 +97,49 @@ class T(unittest.TestCase):
         pc = config.load_pipeline(bad)
         with self.assertRaises(config.ConfigError): pc.secret()          # neither secret_env nor insecure
 
+    def test_speed_env(self):
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "tools", "glm"))
+        src = ('import torch\nSPEED_ENV = {\n    # comment\n    "EXL3_A": "1",\n    "EXL3_B": "2048",\n}\n'
+               'def main():\n    for k, v in SPEED_ENV.items():\n        pass\n')
+        open(os.path.join(d, "tools", "glm", "serve.py"), "w").write(src)
+        c, o, _ = run(["speed-env", "--kyojin-root", d])
+        self.assertEqual(c, 0)
+        self.assertIn("# 2 flags", o)
+        self.assertIn('[stage.env]', o)
+        self.assertIn('EXL3_A = "1"', o)
+        self.assertIn('EXL3_B = "2048"', o)
+        c, _, _ = run(["speed-env", "--kyojin-root", tempfile.mkdtemp()])
+        self.assertNotEqual(c, 0)
+
+
+    def test_config_check(self):
+        d = tempfile.mkdtemp()
+        tpl, live = os.path.join(d, "tpl.toml"), os.path.join(d, "live.toml")
+        base = ('[stage]\nnode="s"\nlisten="0.0.0.0:1"\nsecret_env="SWP_SECRET"\nmodel_dir="/m"\n'
+                'layers=[0,4]\nembed=false\nhead=true\nspec_k=8\ncache_tokens=16384\n'
+                '[stage.env]\nEXL3_A = "1"\n[stage.engine]\nmoe_cpu_offload = 3\n')
+        open(tpl, "w").write(base)
+        open(live, "w").write(base.replace('model_dir="/m"', 'model_dir="/other"').replace('listen="0.0.0.0:1"', 'listen="1.2.3.4:9"'))
+        c, o, _ = run(["config-check", "--config", live, "--template", tpl])
+        self.assertEqual(c, 0, o)
+        self.assertIn("OK", o)
+        open(live, "w").write(base.replace('EXL3_A = "1"', 'EXL3_A = "0"'))
+        c, o, _ = run(["config-check", "--config", live, "--template", tpl])
+        self.assertEqual(c, 1)
+        self.assertIn("EXL3_A", o)
+        open(live, "w").write(base.replace('EXL3_A = "1"', 'EXL3_A = "1"\nEXL3_B = "2"'))
+        c, o, _ = run(["config-check", "--config", live, "--template", tpl])
+        self.assertEqual(c, 1)
+        self.assertIn("EXL3_B", o)
+        open(live, "w").write(base.replace("cache_tokens=16384", "cache_tokens=8192").replace("spec_k=8", "spec_k=4"))
+        c, o, _ = run(["config-check", "--config", live, "--template", tpl, "--all"])
+        self.assertEqual(c, 1)
+        self.assertIn("spec_k", o)
+        open(live, "w").write(base.replace("cache_tokens=16384", "cache_tokens=8192"))
+        c, o, _ = run(["config-check", "--config", live, "--template", tpl, "--all"])
+        self.assertEqual(c, 0, o)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

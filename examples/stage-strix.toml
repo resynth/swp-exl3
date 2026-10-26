@@ -1,19 +1,65 @@
 # Strix Halo (Ubuntu Server 26.04, Kyojin 1.5.0, ROCm). EXAMPLE VALUES: take layers from `swp-plan`.
-# HIP presents as "cuda:0" in torch.
+# HIP presents as "cuda:0" in torch. This file is the canonical template: copy it to the machine and
+# set only the machine-local fields, then check for drift against it.
+#   cp examples/stage-strix.toml /home/m/swp/stage-strix.toml   # set model_dir, listen, cache_tokens
+#   swp-exl3 config-check --config /home/m/swp/stage-strix.toml --template examples/stage-strix.toml
 [stage]
 node = "strix"
 listen = "0.0.0.0:7802"
 secret_env = "SWP_SECRET"            # export SWP_SECRET=... on every machine (or insecure = true on a direct cable)
-model_dir = "/models/GLM-5.3-Flash-exl3"     # full model dir, or a slice dir made by `swp-exl3 pull`
-layers = [20, 44]                    # [first, end): must equal the pipeline file; 44 is a guess, read num_hidden_layers
+model_dir = "/models/GLM-5.3-Flash-exl3"     # machine-local: full model dir, or a slice dir made by `swp-exl3 pull`
+layers = [7, 45]                     # [first, end): must equal the pipeline file; the reference pair is
+                                     # Razer [0, 7) + Strix [7, 45) for GLM-5.3-Flash (45 layers)
 embed = false
 head = true                          # the last stage also holds hc_head, final norm and lm_head
 device = "cuda:0"
-cache_tokens = 16384                 # KV/state cache, multiple of 256
-max_chunk = 512                      # rows per FORWARD (boundary row = hc_mult*hidden*4 bytes = 64 KiB at f32 for GLM-5.3)
+cache_tokens = 65536                 # machine-local: KV/state cache, multiple of 256; size to this host's free memory
+max_chunk = 2048                     # rows per FORWARD (boundary row = hc_mult*hidden*4 bytes = 64 KiB at f32 for GLM-5.3)
 wire_dtypes = ["f32", "bf16"]
 cache_bits = 0                       # 0 = fp16 KV cache; 8 = packed int8 KV (CacheLayer_quant, longer context)
 
-spec_k = 3                           # speculative draft window (verify rollback); 0 disables
+spec_k = 8                           # speculative draft window (verify rollback); 0 disables.
+                                     # 8 enables the n-gram k=8 window (2.14x plain on repetitive text, RESULTS.md)
 # mtp = true                         # head stage only: MTP drafter + read-only embedding copy (S3: no win here)
 # mtp_cache_tokens = 8192
+
+# Kyojin 1.5.0 `tools/glm/serve.py` SPEED_ENV. Regenerate with:
+#   swp-exl3 speed-env --kyojin-root /path/to/kyojin
+# These are engine-specific: on upstream exllamav3 the names are simply unread.
+[stage.env]
+EXL3_CONV_GEMM = "1"
+EXL3_DENSE_GEMM_TUNE = "0"
+EXL3_MOE_CFG = "2"
+EXL3_HIP_PREFILL_MIN_ROWS = "2"
+EXL3_BLOCK_GRAPH = "1"
+EXL3_BLOCK_GRAPH_MLA = "2"
+EXL3_HC_FN_HALF_PF = "1"
+EXL3_HC_1PASS_PF = "1"
+EXL3_DEC_DSA_FAST = "1"
+EXL3_MIDCHUNK_CKPT = "2"
+EXL3_PREFILL_BIG_TAIL = "1"
+EXL3_BIG_TAIL_DENSE = "1"
+EXL3_PREFILL_BIG_CHUNK_MAXPOS = "32768"
+EXL3_VERIFY_FUSE = "1"
+EXL3_DEC_ROUTER_ROWS = "2"
+EXL3_MOE_COMBINE_WIDE = "1"
+EXL3_MOEDEC1_RM3 = "1"
+EXL3_MOEDEC1_KBS_A = "3"
+EXL3_GEMV_R_DEC1 = "1"
+EXL3_DSA_GLUE_FUSE = "1"
+EXL3_PF_HC_FUSE = "1"                # validated: +4.4% on 1.5k prefill vs off (RESULTS.md T4)
+EXL3_PF_GR_FUSE = "0"                # +2.3% alone, no gain on top of HC_FUSE, so kept off (RESULTS.md T4)
+EXL3_MPW2X = "2"
+EXL3_MLA_PF_FAST = "1"
+EXL3_KDA_PF_SPLIT = "2"
+EXL3_PF_NO_TAIL = "1"
+EXL3_HOST_LEAN = "1"
+EXL3_HOST_CUTS = "1"
+EXL3_PF_GLUE = "1"
+EXL3_PF_MSPLIT = "2048"
+EXL3_PF_SKIP = "1"
+# Not in SPEED_ENV: split 5-8 row verify rounds (Kyojin `modules/row_split.py`, default off).
+# 2 = split only the MoE (GEMV/hc take 5-8 rows natively); -23%/-24% on B=6/B=7 verify rounds (RESULTS.md T6).
+EXL3_VERIFY_ROW_SPLIT = "2"
+# Optional MTP runs only: unquantized eh_proj sidecar (see README section 3.3). Left unset here.
+# EXL3_MTP_EH_FP16 = "/home/m/models/glm53-mtp-eh-proj-bf16.safetensors"

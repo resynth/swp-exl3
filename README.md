@@ -8,7 +8,7 @@ Target: GLM-5.3-Flash. Seen working on a Strix Halo (Kyojin, ROCm) + a Razer (up
 CUDA); see `BRINGUP.md` and `MEASUREMENTS.md` for a full run record and benchmarks.
 
 - `swp-exl3` is one console script with subcommands: `doctor`, `stage`, `pull`, `ping`, `generate`,
-  `smoke`, `logits`, `compare`. It can also be run as `python -m swp_exl3 ...`.
+  `smoke`, `logits`, `compare`, `speed-env`, `config-check`. It can also be run as `python -m swp_exl3 ...`.
 - Only `stage` is machine-local work (it loads a slice and serves it). The rest are coordinator-side.
 - Every network command needs a shared secret: put `secret_env = "SWP_SECRET"` in the config and
   `export SWP_SECRET=...` on each machine, or set `insecure = true` on a trusted/direct link.
@@ -85,6 +85,45 @@ When the engine ships `exllamav3.modules.block_sparse_mlp_cpu`, `doctor` also re
 offload knobs and their defaults (`moe_cpu_offload`, `moe_cpu_split`, `moe_cpu_threads`,
 `moe_cpu_pinned_arena`, `draft_moe_cpu_*`). An engine without that module gets a warning, not a
 failure, because not every build supports CPU offload.
+
+### `swp-exl3 speed-env` — print Kyojin's engine flags as `[stage.env]`
+
+```
+swp-exl3 speed-env --kyojin-root DIR
+```
+
+Kyojin's `tools/glm/serve.py` carries a `SPEED_ENV` dict of `EXL3_*` tuning flags (30 flags in 1.5.0;
+the count and contents are read from the installed checkout, not this repo). The command evaluates it
+as data, so nothing is imported, and prints a ready-to-paste table:
+
+```bash
+swp-exl3 speed-env --kyojin-root /home/m/engines/kyojin
+# merge the printed [stage.env] into the stage file (or append it if the file has no [stage.env])
+```
+
+Only add it to a **Kyojin** stage: the flags are consumed by that engine's kernels; other builds
+simply see unknown environment names. The adapter still leaves `EXL3_PF_GR_FUSE=0` at its default,
+and an explicit value in `[stage.env]` wins over it.
+
+### `swp-exl3 config-check` — live stage config vs the repo template
+
+```
+swp-exl3 config-check --config LIVE.toml --template TEMPLATE.toml [--all] [--ignore FIELD ...]
+```
+
+The live stage configs live on the machines (absolute `model_dir`, `listen` address, memory-sized
+`cache_tokens`), so they are not in the repo; their *decisions* are, as `examples/stage-razer.toml`
+and `examples/stage-strix.toml`. This command diffs the two so a flag cannot drift unnoticed.
+
+By default it compares only `[stage.env]` and `[stage.engine]`, key by key, and exits non-zero on any
+missing/extra/changed key. `--all` compares every field except the host-local ones (`model_dir`,
+`listen`, `cache_tokens`, `mtp_cache_tokens`, plus anything in `--ignore`).
+
+```bash
+cp examples/stage-strix.toml /home/m/swp/stage-strix.toml       # then set model_dir/listen/cache_tokens
+swp-exl3 config-check --config /home/m/swp/stage-strix.toml --template examples/stage-strix.toml
+# OK  /home/m/swp/stage-strix.toml matches examples/stage-strix.toml on [stage.env] and [stage.engine]
+```
 
 ### `swp-exl3 pull` — fetch one stage's tensors from a `swp-weightd`
 
@@ -305,7 +344,9 @@ moe_cpu_split = 32               # or moe_cpu_offload = N   (see §5)
 # optional: extra kwargs for model.load()
 [stage.load]
 
-# optional: environment variables set before exllamav3 is imported
+# optional: environment variables set before exllamav3 is imported.
+# The full Kyojin flag set lives in `examples/stage-strix.toml`; check a live file against it with
+#   swp-exl3 config-check --config <live stage.toml> --template examples/stage-strix.toml
 [stage.env]
 ```
 

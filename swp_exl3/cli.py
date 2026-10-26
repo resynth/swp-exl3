@@ -98,6 +98,67 @@ def cmd_pull(a):
          include_vision=a.vision, tied_embed=a.tied_embed)
 
 
+def kyojin_speed_env(kyojin_root):
+    import ast
+    path = os.path.join(os.path.expanduser(kyojin_root), "tools", "glm", "serve.py")
+    try:
+        src = open(path, encoding="utf-8").read()
+    except OSError as e:
+        raise SystemExit(f"cannot read {path}: {e}")
+    i = src.find("SPEED_ENV = {")
+    if i < 0:
+        raise SystemExit(f"{path}: no 'SPEED_ENV = {{' block found")
+    j = src.find("\n}\n", i)
+    if j < 0:
+        raise SystemExit(f"{path}: unterminated SPEED_ENV block")
+    d = ast.literal_eval(src[i + len("SPEED_ENV = "):j + 3])
+    if not isinstance(d, dict) or not all(isinstance(k, str) and isinstance(v, (str, int, float)) for k, v in d.items()):
+        raise SystemExit(f"{path}: SPEED_ENV is not a flat str->scalar dict")
+    return d
+
+
+def cmd_speed_env(a):
+    d = kyojin_speed_env(a.kyojin_root)
+    print(f"# {len(d)} flags from {os.path.expanduser(a.kyojin_root)}/tools/glm/serve.py")
+    print("[stage.env]")
+    for k, v in d.items():
+        print(f'{k} = "{v}"')
+
+
+def _dict_diff(where, t, l):
+    return [f"  {where}.{k}: template={t.get(k)!r} live={l.get(k)!r}"
+            for k in sorted(set(t) | set(l)) if str(t.get(k)) != str(l.get(k))]
+
+
+def cmd_config_check(a):
+    """Compare a machine-local stage config against a repo template so the flags do not drift unnoticed.
+    Default compares [stage.env] and [stage.engine]; --all compares every field except the host-local ones."""
+    import dataclasses
+    from .config import load_stage
+    tpl, live = load_stage(a.template), load_stage(a.config)
+    if a.all:
+        ignore = set(a.ignore) | {"model_dir", "listen", "cache_tokens", "mtp_cache_tokens"}
+        rows = []
+        for f in dataclasses.fields(live):
+            if f.name in ignore:
+                continue
+            tv, lv = getattr(tpl, f.name), getattr(live, f.name)
+            if isinstance(tv, dict) and isinstance(lv, dict):
+                rows += _dict_diff(f.name, tv, lv)
+            elif tv != lv:
+                rows.append(f"  {f.name}: template={tv!r} live={lv!r}")
+        what = f"all fields except {', '.join(sorted(ignore))}"
+    else:
+        rows = _dict_diff("[stage.env]", tpl.env, live.env) + _dict_diff("[stage.engine]", tpl.engine, live.engine)
+        what = "[stage.env] and [stage.engine]"
+    if not rows:
+        print(f"OK  {a.config} matches {a.template} on {what}")
+        return 0
+    print(f"DIFF  {a.config} vs {a.template} on {what}")
+    print("\n".join(rows))
+    return 1
+
+
 def cmd_ping(a):
     p, _ = _pipeline(a)
     for s, r in zip(p.stages, p.rtt_ms(100)):
@@ -311,6 +372,17 @@ def main(argv=None):
 
     s = sp.add_parser("compare", help="compare two saved logit files (cut-invariance check, step 2)")
     s.add_argument("a"); s.add_argument("b"); s.add_argument("--max-kl", type=float, default=1e-3); s.set_defaults(fn=cmd_compare)
+
+    s = sp.add_parser("speed-env", help="print Kyojin's SPEED_ENV block as a [stage.env] table")
+    s.add_argument("--kyojin-root", required=True, help="Kyojin checkout (contains tools/glm/serve.py)")
+    s.set_defaults(fn=cmd_speed_env)
+
+    s = sp.add_parser("config-check", help="diff a machine-local stage config against a repo template (env/knob drift)")
+    s.add_argument("--config", required=True, help="live stage config on this machine")
+    s.add_argument("--template", required=True, help="repo template, e.g. examples/stage-strix.toml")
+    s.add_argument("--all", action="store_true", help="compare every field, not just [stage.env] and [stage.engine]")
+    s.add_argument("--ignore", action="append", default=[], help="field to ignore with --all (repeatable)")
+    s.set_defaults(fn=cmd_config_check)
 
     a = ap.parse_args(argv)
     if a.cmd == "generate" and not (a.prompt or a.prompt_file or a.ids or a.ids_file):
