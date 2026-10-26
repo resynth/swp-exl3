@@ -86,6 +86,47 @@ noise), warm prefill is +6.5% (217.7 vs 204.4), and adapter/wire cost is **0.17 
 text matches the native run. The ~4.2 ms/token overhead in the two-machine pipeline is therefore
 the remote boundary transfer/queue, not the adapter itself.
 
+### MTP projection sidecar (Model A, 4-bit MTP)
+
+The sidecar question is now closed for Model A. Its `quantization_config.json` has
+**`mtp_bits = 4`**, not the 2 that older notes assumed. The larger sidecar gains reported
+elsewhere (+0.077 acceptance / +4.8% decode in the Kyojin note; +18% on the Yamz pack card) were
+measured with a 2-bit `eh_proj` (the Yamz pack itself has `mtp_bits = 2`), so they do not transfer
+to packs A/B.
+
+**Installed outside the packs**, at the shared default path Kyojin's server already probes:
+`/home/m/models/glm53-mtp-eh-proj-bf16.safetensors` (67,108,992 B = 64 MiB). Key
+`model.language_model.layers.45.eh_proj.weight`, shape `[4096, 8192]`, `bfloat16`, sha256
+`37ea317a0c60b328430905835869684b2fd8401c2d26a707471a03b0c1229015` (matches `SHA256SUMS` in
+`yamz-labs/GLM-5.3-Flash-EXL3-Yamz`; the file there is `mtp_eh_proj.st`, copied from the
+official release). No copy was put in either pack.
+
+Selection (Kyojin `apply_eh_sidecar_default` + engine `load_eh_proj_sidecar`): explicit
+`EXL3_MTP_EH_FP16=<file>` wins; unset -> `mtp_eh_proj.st` in the model folder, else the shared
+default above; `EXL3_MTP_EH_FP16=0` disables. All three cases were verified on the Strix.
+
+**Three arms**, native `tools/glm/serve.py`, Model A alone on the Strix, `--no-vision -c 8192`,
+`EXL3_SERVE_WARMUP=0`, one fixed 185-token prompt (186 with BOS), greedy, 200 new tokens. Each arm
+got a 200-token warm-up request with a different first token, then two measured runs.
+
+| arm | decode tok/s (server, 2 runs) | decode tok/s (client) | prefill tok/s | accepted / proposed | acceptance | rounds |
+|---|---|---|---|---|---|---|
+| MTP off (`--num-draft 0`) | 19.54 / 19.55 | 19.55 / 19.55 | 197 / 212 | — | — | — |
+| MTP on, `EXL3_MTP_EH_FP16=0` | 23.80 / 23.89 | 23.93 / 24.02 | 195 / 209 | 107 / 186 | 57.5% | 93 |
+| MTP on, sidecar | **23.99 / 24.07** | **24.13 / 24.20** | 190 / 204 | 108 / 184 | **58.7%** | 92 |
+
+* `g` = MTP on / off: **1.220** without the sidecar, **1.230** with it. The plan's `g >= 1.2`
+  gate passes either way.
+* Sidecar vs no sidecar: **+0.77% decode**, **+1.2 pp acceptance** (57.5 -> 58.7). Small,
+  deterministic on this prompt, and free; keep it.
+* Load: 111.6 GB torch-allocated in both MTP-on arms (the sidecar is 64 MiB); 105.8 GB MTP-off.
+  Prefill and load time are unchanged within noise.
+* This does not change the decision: MTP is the lever (~1.22x), the sidecar is a rounding error
+  at `mtp_bits = 4`. Model B was not measured alone (it still does not fit: 119 GiB vs 118 GiB
+  visible), but its MTP tensor is also 4-bit, so expect a similar small gain.
+* Raw `mtp_sidecar_results.json` and the three server logs are in
+  `/home/m/models/mtp_sidecar_bench/` on the Strix.
+
 ## Task 3 — stage warm-up
 
 Improvement for the **first prefill after a stage starts**, not for steady-state speed.
@@ -212,6 +253,160 @@ overhead is ~2.0 ms/token. `STRIX-IDLE-WAKE.md` covers the options, costs and ve
 The final smoke (local stage 0, Strix back in its slow state) measured 15.47 tok/s with stage 0
 0.36 ms and stage 1 3.04 ms, showing the same bimodality.
 
+## Step S1 — protocol + speculative loop on the fake backend
+
+**Protocol (splitwire first).** SWP/1 gains the additive, capability-gated `spec` path: stages advertise
+`spec` in HELLO and `spec_k` in STAGE_READY; FORWARD accepts `mode:"verify"`, `draft_ids`, `accept`,
+`sampling`, `next_drafts`; the head may answer `kind:"spec"` with `accepted`, `tokens` (int32 payload),
+`drafts`, `timing`. The "rewind only immediately after a verify forward" rule and the lazy-rewind
+contract are documented in `splitwire/README.md` and the canonical `splitwire/python/swp.py`; the
+vendored `swp_exl3/swp.py` is re-copied and `tests/test_swp_sync.py` passes. Rust only gains the
+`CAP_SPEC` constant (no behaviour change).
+
+**Mechanism.** `Pipeline.generate(..., spec=SpecConfig)` proposes `k` drafts from the driver side,
+sends a `k+1`-row verify forward with `rewrite=true`, and emits the accepted prefix plus the bonus
+token. The next round starts at `len(history)` and rewinds the rejected rows lazily (or clears +
+replays if a stage answers `unsupported`). `FakeBackend` keeps per-position layer inputs for recurrent
+layers, so `GDNState.rewind` semantics (only after a verify, only within the history window) are
+tested on the toy. `Pipeline.spec_check()` compares verify logits against sequential decode from the
+same state.
+
+**Tests.** New `tests/test_spec.py` (10 tests): all-accept, all-reject and mixed acceptance on 2 and 3
+stages (output exactly equals non-speculative greedy), forced illegal rewind -> clear+replay still
+exact, verify-vs-sequential logits, server rewind rules, n-gram lookup, CLI `--spec`, and `spec_k=0`
+fallback. Full suite: **32 tests, OK** (1 skips without `SWP_WEIGHTD`).
+
+## Step S2 — prompt-lookup speculation on the real engines
+
+Stages: Model B `[0,7)` / `[7,45)`, f32, chunk 2048, `spec_k = 3`. The backend now sets
+`max_history = spec_k + 1 = 4` (one extra row over the engine's `k+1`-row window). Load cost vs
+RESULTS above: Strix **111.16 GB allocated (15.35 GB free)** vs 110.80 GB, i.e. **+0.36 GB**; Razer
+still 13.30 GB (3.18 GB free).
+
+**Critical engine finding — settle every verify, including a full accept.** The recurrent state is
+provisional after a `recurrent_history` pass. The engine's generator calls `rewind(num_rejected)`
+after *every* verification, including `rewind(0)` when all drafts matched. Without that settle the
+first implementation had **4/20 top-1 mismatches and KL 2.25**; with `rewind(0)` (and lazy
+`rewind(k-m)` for partial accepts) it is **0/20 mismatches and KL 5.0e-3**. This is now in
+`Exl3Backend._settle_verify`, called before the next forward as well as from `truncate`.
+
+**Smoke check (verify logits vs sequential, 20 rows, k=3).**
+
+| check | result |
+|---|---|
+| top-1 mismatches | **0 / 20** |
+| max KL (top-8, shared, renormalised) | **5.01e-3** |
+| smoke threshold | top-1 equal and KL <= **1e-2** (relaxed from the plan's 1e-3; see below) |
+
+The 1e-3 KL gate is not reachable at k=3 because of the engine's **batched** kernels, not SWP:
+1-row verify is bit-identical (KL 0), 2-row is 3.2e-5, 3/4-row reaches 5.0e-3. A plain 4-row prefill
+(no `recurrent_history`) shows exactly the same delta as the 4-row verify, and stage 0's hidden
+boundary differs by only **max |Δ| 5.6e-4** between one 4-row forward and four 1-row forwards. Top-1
+is equal at every row and in every round. The smoke gate is therefore top-1 plus KL <= 1e-2.
+
+**Bench (warm persistent stages, greedy).**
+
+| prompt | mode | decode tok/s | stage 0 ms/tok | stage 1 ms/tok | prefill tok/s | spec rounds | accepted |
+|---|---|---|---|---|---|---|---|
+| repetitive 42-tok code | plain | **15.03** | 6.99 | 54.81 | 89.3 | — | — |
+| repetitive 42-tok code | `--spec` | **24.91** | 2.76 | 35.90 | 88.3 | 16 | **48/48 (100%)** |
+| non-repetitive 149-tok | plain | 15.05 | 6.81 | 55.05 | 175.7 | — | — |
+| non-repetitive 149-tok | `--spec` | 15.02 | 6.55 | 55.82 | 176.2 | 4 | 5/12 (41.7%) |
+| repetitive, T=0.8, 32 new | `--spec` | 23.38 | — | — | 88.4 | 8 | 24/24 (100%) |
+
+* **1.66x on repetitive output** (24.91 / 15.03), repeatable (24.90 / 24.91). One round advances
+  ~4 tokens (3 drafts + bonus) for 4 verified rows, so both stages' compute per *emitted* token drops
+  even though each verify row costs the same as a decode row.
+* **Neutral on non-repetitive output** (15.02 vs 15.05): the n-gram lookup mostly misses, and missed
+  rounds fall back to a plain 1-token decode, so there is no verify overhead.
+* **Output is byte-identical to plain greedy** on both prompts (captured stdout, `cmp`; 48 new tokens
+  each), including the non-repetitive run where only 5/12 drafts were accepted and several lazy
+  rewinds ran.
+* `T > 0` uses "sample target, accept on equality" in the head stage (seeded by `seed` + round); one
+  sampled run completed cleanly at 23.38 tok/s.
+* Aside (pre-existing Task 3 coverage): on a just-loaded pair the first 149-token prefill can be
+  1.68x the warm one, because the synthetic warm-up rows (16/64/256/512) do not include 149; the
+  second run is **0.97x**. Not caused by speculation, but worth adding ~150 rows to the warm-up.
+
+## Step S3 — MTP drafter on the head stage
+
+**Outcome: implemented, correct, and gated.** The drafter works and the target stays bit-identical,
+but no k reaches the plan's 1.15x exit (best **15.5 tok/s vs 15.05 plain, 1.03x**). The S3.4 stop
+rule (miss 1.10x after the k sweep) and the S3.0 cost math both fire. The n-gram S2 path remains the
+default; `mtp = true` enables the drafter.
+
+### S3.0 go/no-go (Model B, Strix head stage)
+
+* **Capacity (pass).** Loading the `[7,45)` head slice (111.15 GB), the MTP block (3.70 GB), a
+  read-only `embed_tokens` copy (1.27 GB) and a separate 8192-token drafter cache allocates
+  **116.31 GB, 10.13 GB free** (target cache also 8192; the pair's context cap is 8192 anyway).
+* **Warm drafter cost.** A 1-row MTP forward **1.5–2.3 ms** after the first (1.42 s cold, paid in
+  the stage warm-up); rollouts **4.8 / 7.6 / 11.4 ms** for k=1/2/3; catch-up prefill
+  **~0.9–6 ms** for 1–3 rows. So the drafter itself is not the blocker.
+* **Verify cost curve.** On the 100%-accept repetitive prompt (n-gram, k=1..4): **2/3/4/5 rows =
+  117 / 136 / 160 / 181 ms** per round. The 5-row point already costs 181 ms; with realistic
+  acceptance the 5th draft cannot repay that row, so C(4) rules out k=4 before drafting.
+* **API (pass).** Kyojin 1.5.0 has `Glm5NextMTPModel.attach_to` / `sample_from_state` (no
+  `load_eh_proj_sidecar` on upstream 1.6.4; optional there); `export_state_norm_keys` is consumed
+  by `RMSNorm`/`HyperHead` and appends `params["export_states"]`. `check_api_against_source.py`
+  grew the corresponding checks: **Razer 62/62, Strix 61/62** (the one known
+  `Cache.recurrent_dtype` mismatch on Kyojin 1.5.0 remains).
+* **Sidecar.** The 64 MiB bf16 `eh_proj` sidecar was loaded from
+  `/home/m/models/glm53-mtp-eh-proj-bf16.safetensors`; its effect was not isolated.
+
+### S3.1/S3.2 implementation
+
+The head stage loads `Glm5NextMTPModel` from the same pack, a read-only `Embedding`, and a drafter
+`Cache` (all before `load()`). A local attach shim supplies the MTP block with the head slice's
+shared `lm_head` and the embedding (the stock `attach_to` asserts a full target model). Every target
+forward sets `export_state_norm_keys` (the final `model.norm`), so the prefill already exports all
+prompt hiddens; the drafter cache mirrors the prompt/chunks with the shifted hidden (zero first row).
+A verify does: rewrite row L with the token being verified, accept `m`, catch-up the accepted rows
+with their real target hiddens, then feed the bonus to produce the next round's drafts. The
+coordinator consumes `drafts` and the `drafts_basis` check; it **prefers an n-gram match** and only
+falls back to MTP on novel text, which keeps the S2 repetitive result intact. The drafter cache is
+attention-only; `truncate` into an earlier prefix answers `unsupported` so the coordinator replays.
+
+### S3.3 k sweep (149-token novel prompt, greedy, warm stages)
+
+| k | rounds | accepted / drafts | acceptance | accepted/depth | decode tok/s | verify wall / round | catch-up / round | MTP roll / round | tokens/round |
+|---|---|---|---|---|---|---|---|---|---|
+| plain | — | — | — | — | **15.05** | 66.5 ms/token | — | — | — |
+| 1 | 27 | 19 / 27 | 70.4% | [19] | 14.15 | 120.2 ms | 2.0 | 4.7 | 1.70 |
+| 2 | 21 | 26 / 42 | 61.9% | — | 14.56–15.12 | 144.2 ms | 2.1 | 7.2 | 2.24 |
+| **3** | 17 | **28 / 51** | **54.9%** | **[13, 10, 5] = 76.5/58.8/29.4%** | **15.49–15.51** | 163.4 ms | 2.1 | 10.8 | **2.65** |
+
+* `verify` is the whole round wall (target verify + catch-up + MTP rollout); the last two columns are
+  the subsets reported by the head, and `tokens/round` is the nominal `1 + accepted/round`.
+* Subtracting catch-up+roll gives a **target-only 150.6 ms/round** at k=3: with 2.65 tokens that is
+  17.6 tok/s, but the drafter adds 12.9 ms/round (16.2 tok/s) and the one plain bootstrap round costs
+  ~130 ms, so the measured 48-token rate is 15.5 (**1.03x**). Even eliminating the bootstrap leaves
+  ~16.2 (1.08x), below the 1.10x stop threshold.
+* Repetitive 42-token prompt, k=3: **24.13 tok/s** (12 rounds, 36/36, **0 MTP rolls** — the n-gram
+  lookup wins and the coordinator does not ask the drafter); a later default-config run measured
+  24.53. S2 was 24.47. No regression on the repetitive path.
+* Depth-2 acceptance is 29%. A confidence stop that skipped depth 2 would trade 0.29 tokens/round
+  for ~27 ms, which *could* reach ~17.6 tok/s if depth-2 confidence separates cleanly. It was not
+  implemented: the stop rule fired after the k sweep (<1.10x measured). This is the first thing to
+  try if S3 is resumed.
+
+### S3.4 correctness
+
+* `swp-exl3 smoke` **PASS** with MTP loaded: both 48-token prompts are token-identical to the
+  golden (created without MTP), top-64 logits top-1 equal, 64/64 shared, `max |Δlogit| 0`, KL 0.
+  So the hidden-state export is read-only.
+* Verify-vs-sequential check with the drafter loaded: **0/20 top-1 mismatches, max KL 5.01e-3**
+  (k=3), unchanged from S2's batched-kernel floor.
+* Legal-rewind/catch-up paths were exercised by the k sweep (partial accepts included); unit suite
+  **34 tests, OK** (1 skips without `SWP_WEIGHTD`), including a fake-backend test that consumes
+  head-provided drafts and checks exactness.
+
+### Decision
+
+Stop at the gate. Keep the implementation (config `mtp = false` by default) and the n-gram path.
+If MTP is revisited, the lever is the target verify cost, not the drafter: the 2-row round already
+costs ~120 ms of a 66.5 ms token budget.
+
 ## Other findings
 
 * **First-forward warm-up is real even with kernels cached.** A freshly loaded Razer stage spent
@@ -226,5 +421,17 @@ The final smoke (local stage 0, Strix back in its slow state) measured 15.47 tok
 
 ## State after these measurements
 
-All stage/serve processes are stopped; the Strix is idle (122 GB free), the Razer GPU is free.
-The remote `/home/m/swp/swp-exl3` tree was synced to the current local tree for the single-stage run.
+All stage/serve processes are stopped (including the S3 Razer and Strix stages); the Strix is idle,
+the Razer GPU is free. The remote `/home/m/swp/swp-exl3` tree is synced to the current local tree.
+The Strix stage config is left with `mtp = false` (the measured default); enable it with
+`mtp = true` and `mtp_cache_tokens = 8192` to reproduce the S3 rows.
+
+## Files changed for S1/S2/S3
+
+* `swp-exl3`: `swp_exl3/{backend,server,exl3_backend,coordinator,config,cli,swp}.py`,
+  `tests/test_spec.py` (S1/S2/MTP), `tests/test_pipeline.py` (`start(..., **be_kw)`), `README.md`,
+  `examples/stage-{razer,strix}.toml`, `tools/check_api_against_source.py`.
+* `splitwire`: `python/swp.py` (capabilities + spec section), `README.md` (protocol section),
+  `src/msg.rs` (`CAP_SPEC` only; `CAP_MTP` is Python-side because it changes no wire framing).
+* Stage configs: `spec_k = 4` and `cache_tokens = 8192` on the Strix for the S3 sweep; `mtp`
+  defaults to false. `spec_k = 0` in `[stage]` disables the `spec` capability entirely.

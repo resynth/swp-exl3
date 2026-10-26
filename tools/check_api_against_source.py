@@ -78,8 +78,23 @@ for c_ in ("Embedding(", "ExpandStreams(", "TransformerBlock(", "HyperHead(", "R
     check(f"Glm5Next builds {c_[:-1]}", lambda c_=c_: c_ in G)
 check("Glm5Next recurrent state class (GDNState)", lambda: "recurrent_state_cls" in G)
 
+MT = src("architecture/glm5_next_mtp.py")
+mtp = cls(ast.parse(MT), "Glm5NextMTPModel")
+mtpf = funcs(mtp)
+check("class Glm5NextMTPModel", lambda: "Glm5NextMTPModel" in MT)
+for m in ("attach_to", "sample_from_state", "prepare_inputs", "default_load_params"):
+    check(f"Glm5NextMTPModel.{m}", lambda m=m: m in mtpf)
+check("Glm5NextMTPModel.load_eh_proj_sidecar (optional)",
+      lambda: True if "load_eh_proj_sidecar" in mtpf else "absent: sidecar ignored")
+check("Glm5NextMTPModel.draft_verifier_params", lambda: "draft_verifier_params" in MT)
+check("Model.from_config(component=)", lambda: "component" in params(mf["from_config"]))
+check("Model.prefill(input_ids, params)", lambda: "prefill" in mf and params(mf["prefill"])[:3] == ["self", "input_ids", "params"])
+check("modules.Embedding", lambda: "class Embedding" in src("modules/embedding.py"))
+check("Embedding.load(device)", lambda: "load" in funcs(cls(tree("modules/embedding.py"), "Embedding")))
+
 allsrc = "".join(src(os.path.relpath(os.path.join(d, f), root)) for d, _, fs in os.walk(root) for f in fs if f.endswith(".py"))
-for k in ("last_tokens_only", "recurrent_states", "past_len", "batch_shape", "attn_mode", "infer_params", "moe_cpu_offload"):
+for k in ("last_tokens_only", "recurrent_states", "past_len", "batch_shape", "attn_mode", "infer_params",
+          "moe_cpu_offload", "export_state_norm_keys", "export_states", "target_hidden"):
     check(f"engine references '{k}'", lambda k=k: k in allsrc)
 check("Module.prepare_for_device", lambda: "prepare_for_device" in src("modules/module.py"))
 check("Config.from_directory", lambda: "from_directory" in src("model/config.py"))

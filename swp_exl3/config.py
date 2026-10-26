@@ -34,6 +34,10 @@ class StageConfig:
     insecure: bool = False
     recurrent_dtype: str = "half"
     max_history: int = 0
+    spec_k: int = 3                                 # speculative draft window; 0 disables the `spec` capability
+    mtp: bool = False                               # load the MTP drafter + embedding copy on the head stage
+    mtp_model_dir: str = None                       # pack holding the MTP/embed tensors (default: model_dir)
+    mtp_cache_tokens: int = None                    # drafter cache size (default: cache_tokens)
     warmup: bool = True                             # synthetic forwards after load() to remove first-prefill warm-up
     engine: dict = field(default_factory=dict)     # set on config.infer_params, e.g. moe_cpu_offload
     load: dict = field(default_factory=dict)       # extra kwargs for model.load()
@@ -76,10 +80,17 @@ def load_stage(path):
         cache_tokens=int(t.get("cache_tokens", 8192)), max_chunk=int(t.get("max_chunk", 512)),
         wire_dtypes=tuple(t.get("wire_dtypes", ("f32", "bf16"))), secret_env=t.get("secret_env"),
         insecure=bool(t.get("insecure", False)), recurrent_dtype=t.get("recurrent_dtype", "half"),
-        max_history=int(t.get("max_history", 0)), warmup=bool(t.get("warmup", True)),
+        max_history=int(t.get("max_history", 0)), spec_k=int(t.get("spec_k", 3)),
+        mtp=bool(t.get("mtp", False)), mtp_model_dir=t.get("mtp_model_dir"),
+        mtp_cache_tokens=(int(t["mtp_cache_tokens"]) if t.get("mtp_cache_tokens") else None),
+        warmup=bool(t.get("warmup", True)),
         engine=dict(t.get("engine", {})), load=dict(t.get("load", {})), env=dict(t.get("env", {})))
     if c.cache_tokens % 256:
         raise ConfigError("cache_tokens must be a multiple of 256")
+    if c.mtp_cache_tokens is not None and c.mtp_cache_tokens % 256:
+        raise ConfigError("mtp_cache_tokens must be a multiple of 256")
+    if c.mtp and not c.head:
+        raise ConfigError("[stage] mtp = true is only valid on the head stage (head = true)")
     return c
 
 

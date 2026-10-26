@@ -40,7 +40,7 @@ JIT-compile its CUDA/HIP extension on first use (minutes); if `import exllamav3`
 stale lock at `~/.cache/torch_extensions/*/<ext>/lock` (this torch blocks while the file exists).
 
 Verified on the reference pair: **exllamav3 1.6.4** (Razer, CUDA 13.3) and **Kyojin 1.5.0** (Strix,
-ROCm 7.13). Local suite: `python -m unittest discover -s tests` → **22 tests**, all pass with
+ROCm 7.13). Local suite: `python -m unittest discover -s tests` → **34 tests**, all pass with
 `SWP_WEIGHTD` set; 1 self-skips without it (the provisioning test).
 
 > Kyojin is often *not* pip-installed — its `serve.py` works from the repo root. Run `swp-exl3`
@@ -155,6 +155,7 @@ swp-exl3 generate --pipeline FILE [--no-contract]
                   (--prompt TEXT | --prompt-file FILE | --ids a,b,c)
                   [--chat] [--system S] [--max-new N] [--temperature F] [--top-p F]
                   [--seed N] [--stop-id ID ...] [--bench] [--json FILE]
+                  [--spec] [--spec-k N] [--spec-match N]
 ```
 
 | argument | default | meaning |
@@ -169,6 +170,9 @@ swp-exl3 generate --pipeline FILE [--no-contract]
 | `--stop-id` | — | extra stop token id (repeatable); tokenizer EOS and `<\|user\|>`/`<\|endoftext\|>`/`<\|observation\|>` are always stops |
 | `--bench` | off | print prefill/decode tok/s and per-stage compute vs wire |
 | `--json` | — | write the bench report to a file (with `--bench`) |
+| `--spec` | off | speculative decode with prompt-lookup (n-gram) drafting: one verify forward per round proposes `k` tokens and accepts the matching prefix |
+| `--spec-k` | `3` | drafts per verify round, capped by the stages' `spec_k` |
+| `--spec-match` | `2` | n-gram match length used to look up the draft in the existing history |
 
 ```bash
 export SWP_SECRET=...
@@ -183,6 +187,10 @@ swp-exl3 generate --pipeline examples/pipeline.toml --prompt "Write a haiku abou
 # long prompt from a file, JSON report
 swp-exl3 generate --pipeline examples/pipeline.toml --prompt-file prompt.txt \
   --max-new 256 --bench --json bench.json
+
+# speculative decode (prompt-lookup drafting; best on repetitive output such as code or lists)
+swp-exl3 generate --pipeline examples/pipeline.toml --prompt "Continue: red green blue red green blue" \
+  --max-new 64 --spec --spec-k 3 --bench
 ```
 
 `--bench` output (per stage: device-synced compute vs wire+queue, and how much of the token the stage
@@ -207,9 +215,11 @@ swp-exl3 smoke --pipeline FILE [--golden FILE] [--update-golden] [--max-kl F]
 
 Pings both stages, runs the bench prompt once (the first real prefill, printed against a warm repeat
 to show the stage warm-up), runs two fixed greedy prompts for 48 tokens, checks one top-64 logit row
-(top-1 equal and KL ≤ `--max-kl`, default `1e-4`), and prints one `--bench` report. Warm run is
-about 17 s. The golden defaults to `<pipeline>.golden.json`; create it once on a known-good build
-with `--update-golden`, then every change must pass the same check. Exits non-zero on mismatch.
+(top-1 equal and KL ≤ `--max-kl`, default `1e-4`), **compares 20 batched verify rows against
+sequential decode logits** (top-1 equal, KL ≤ 1e-2; skipped when a stage advertises `spec_k = 0`),
+and prints one `--bench` report. Warm run is about 20 s. The golden defaults to
+`<pipeline>.golden.json`; create it once on a known-good build with `--update-golden`, then every
+change must pass the same check. Exits non-zero on mismatch.
 
 ```bash
 SWP_SECRET=... swp-exl3 smoke --pipeline ~/models/pipeline-310-k7.toml --update-golden
@@ -254,8 +264,12 @@ cache_tokens = 8192              # KV/recurrent cache; multiple of 256
 max_chunk   = 512                # max rows per FORWARD
 wire_dtypes = ["f32", "bf16"]    # accepted wire dtypes
 warmup      = true               # synthetic forwards after load() so the first real prefill is not cold
+spec_k      = 3                  # speculative draft window this stage can roll back (0 disables `spec`)
+mtp         = false              # head stage only: load the MTP drafter + embedding copy (see §6)
+# mtp_model_dir = "..."          # pack holding the MTP/embed tensors (default: model_dir)
+# mtp_cache_tokens = 8192        # drafter cache (default: cache_tokens)
 # recurrent_dtype = "half"       # ignored where the engine's Cache lacks it (warned)
-# max_history = 0                # extra attention history
+# max_history = 0                # extra attention history; auto-raised to spec_k for verify windows
 
 # optional: set on config.infer_params before the model is built (engine passthrough)
 [stage.engine]
@@ -310,6 +324,8 @@ loads such a stage, so it costs the same load time as a standalone stage.
 | `SWP_DEBUG_TIMING=1` | stage | log per-forward `prepare/prefetch/forward_ls/flush/advance` ms |
 | `ROCPROFILER_REGISTER_ENABLED=0` | ROCm stage | set automatically by the adapter (before torch) to stop a core spinning |
 | `PYTHONPATH` | Kyojin stages | point at the Kyojin checkout (it is usually not pip-installed) |
+| `EXL3_MTP_EH_FP16` | MTP head stage | optional unquantized `eh_proj` sidecar (`0` disables); read by `load_eh_proj_sidecar` |
+| `EXL3_MTP_PRENORM_H=1` | MTP head stage | tap the pre-norm hyper-head state (default off; matches the llama.cpp reference) |
 
 ---
 
@@ -377,9 +393,22 @@ Hybrid KDA linear attention (recurrent state) + MLA/DSA, MoE, **mHC hyper-connec
 
 * Single device per stage (`device = "cuda:0"`); autosplit loading is rejected (its dummy pass assumes
   token ids as input). CPU expert offload is likewise layer-split-only.
-* No MTP / speculative decoding yet (needs the drafter on the last stage with a copy of the embedding,
-  and recurrent-state history for verify rollback). No prefill pipelining across stages; star topology
-  (coordinator relays).
+* **Prompt-lookup (n-gram) speculative decoding is implemented** (SWP capability `spec`): the coordinator
+  proposes the next `k` tokens from an earlier occurrence of the last 2–3 tokens, one verify forward
+  checks `k+1` rows on both stages, and rejected rows are rewound lazily on the next round (or by
+  clear+replay when a stage cannot). Sampling (`temperature > 0`) uses "sample target, accept on equality" in
+  the head stage. Batched verify logits are not bit-identical to 1-row decode on this engine (measured:
+  1-row verify exact, 2-row KL 3e-5, 3/4-row up to 5e-3; top-1 equal throughout, and a plain batched
+  prefill shows the same delta — it is the engine's batched GDN/attention kernels, not SWP). No prefill
+  pipelining across stages; star topology (coordinator relays).
+* **MTP drafting on the head stage is implemented but off by default** (`mtp = true` enables it; needs
+  Kyojin's `Glm5NextMTPModel`). The head loads the MTP block, a read-only embedding copy and a separate
+  drafter cache, exports the target's final-norm hidden state on every forward, and returns the next
+  round's drafts (`drafts` / `drafts_basis`). The coordinator prefers an n-gram match and falls back to
+  MTP on novel text. Measured on Model B (3.09 bpw, 149-token novel prompt): acceptance 76.5 / 58.8 /
+  29.4% at depths 1/2/3, best decode **15.5 tok/s vs 15.05 plain** (~1.03x) — below the plan's 1.15x
+  gate, so the n-gram path remains the default. Capacity: +5.0 GB on the Strix (MTP 3.76 GB + embed
+  1.27 GB); 116.3 GB allocated, 10.1 GB free at cache 8192. Details in `RESULTS.md` (S3).
 * Prefill uses `forward_ls` on every stage (no early-exit `prefill_ls` shortcut), so the last stage
   also runs the head on the final row of each chunk.
 * bf16 wire and `topk` output are implemented; the cut/offload equivalence checks in `MEASUREMENTS.md`

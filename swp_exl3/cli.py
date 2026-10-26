@@ -1,5 +1,4 @@
-import argparse, json, math, os, sys
-import numpy as np
+import argparse, json, os, sys
 
 
 def _tokenizer(model_dir):
@@ -102,6 +101,7 @@ def _stop_ids(tok):
 
 
 def cmd_generate(a):
+    from .coordinator import SpecConfig
     p, pc = _pipeline(a)
     tok = _tokenizer(pc.model_dir) if pc.model_dir else None
     if a.ids:
@@ -114,13 +114,30 @@ def cmd_generate(a):
         vocab = tok.get_id_to_piece_list()
         stops = _stop_ids(tok)
     stops |= {int(x) for x in (a.stop_id or [])}
+    spec = None
+    if a.spec:
+        spec = SpecConfig(k=a.spec_k, match=a.spec_match, seed=a.seed,
+                          accept="argmax" if a.temperature <= 0 else "sample")
+        if p.spec_k <= 0:
+            print("[spec] a stage advertises spec_k=0; running plain decode", file=sys.stderr)
     print(f"[prompt: {len(ids)} tokens]", file=sys.stderr)
-    gen, st = p.generate(ids, a.max_new, a.temperature, a.top_p, pc.topk, stops, a.seed,
+    gen, st = p.generate(ids, a.max_new, a.temperature, a.top_p, pc.topk, stops, a.seed, spec=spec,
                          on_token=lambda t: (print(vocab[t] if vocab else f"{t} ", end="", flush=True)))
     print()
     if a.bench:
         r = p.report(st, out=lambda s: print(s, file=sys.stderr))
         print(f"reused prefix: {st['reused_prefix']} tokens", file=sys.stderr)
+        if st.get("spec_rounds") is not None:
+            n, d = st["spec_rounds"], max(st["spec_drafted"], 1)
+            print(f"spec: {n} rounds, {st['spec_accepted']}/{st['spec_drafted']} drafts accepted "
+                  f"({100.0 * st['spec_accepted'] / d:.1f}%), k={min(a.spec_k, p.spec_k)}", file=sys.stderr)
+            if st.get("spec_mtp_drafts"):
+                print(f"spec timing: verify {st.get('spec_verify_ms', 0):.1f} ms, catch-up "
+                      f"{st.get('spec_catchup_ms', 0):.1f} ms, mtp roll {st.get('spec_roll_ms', 0):.1f} ms; "
+                      f"{st.get('spec_accepted_per_round', 0):.2f} accepted/round, "
+                      f"{st.get('spec_tokens_per_round', 0):.2f} tokens/round, "
+                      f"{st.get('spec_mtp_drafts', 0)} MTP drafts, "
+                      f"accepted/depth {st.get('spec_depth')}", file=sys.stderr)
         if a.json:
             json.dump(r, open(a.json, "w"), indent=1)
 
@@ -137,15 +154,8 @@ def cmd_logits(a):
 def _compare_logits(x, y):
     """Compare two saved top-k logit records. KL is over the shared top-k, renormalised
     (a proxy; full-vocab KL needs full logits)."""
-    ia, va, ib, vb = np.array(x["ids"]), np.array(x["logits"]), np.array(y["ids"]), np.array(y["logits"])
-    common = [i for i in ia if i in set(ib)]
-    da = dict(zip(ia, va)); db = dict(zip(ib, vb))
-    diffs = [abs(da[i] - db[i]) for i in common]
-    pa = np.exp(np.array([da[i] for i in common]) - max(da[i] for i in common)); pa /= pa.sum()
-    pb = np.exp(np.array([db[i] for i in common]) - max(db[i] for i in common)); pb /= pb.sum()
-    kl = float((pa * np.log(pa / pb)).sum())
-    return {"top1_equal": bool(ia[0] == ib[0]), "shared": len(common), "topk": len(ia),
-            "max_abs": float(max(diffs)), "kl": kl}
+    from .coordinator import compare_topk
+    return compare_topk(x["ids"], x["logits"], y["ids"], y["logits"])
 
 
 def cmd_compare(a):
@@ -196,6 +206,21 @@ def cmd_smoke(a):
     rec["logits"] = {"prompt": SMOKE_LOGIT_PROMPT, "prompt_ids": lid,
                      "ids": ti.tolist(), "logits": tv.tolist()}
 
+    # Speculative verify must reproduce sequential-decode logits row for row (batched attention/recurrent state).
+    # Top-1 equality is the functional gate. The KL tolerance is 1e-2, not 1e-3: the engine's batched GDN/attention
+    # kernels round differently from 1-row decode (measured: 1-row verify bit-identical, 2-row KL 3e-5, 3/4-row
+    # KL up to 5e-3; a plain 4-row prefill shows the same difference, so it is batching, not this code).
+    SPEC_MAX_KL = 1e-2
+    spec_ok = True
+    if p.spec_k > 0:
+        sc = p.spec_check(lid, rows=20, k=min(3, p.spec_k), klog=8)
+        spec_ok = sc["top1"] and sc["max_kl"] <= SPEC_MAX_KL
+        print(f"spec     {'ok' if spec_ok else 'FAIL'}  {sc['rows']} verify rows vs sequential  "
+              f"top-1 mismatches: {sc['bad_top1']}  max KL: {sc['max_kl']:.2e}  (k={sc['k']})", file=sys.stderr)
+    else:
+        print("[spec] stages advertise spec_k=0; verify-vs-sequential check skipped", file=sys.stderr)
+    rec["spec"] = {"rows": 20, "ok": spec_ok}
+
     g, st = _smoke_generate(p, tok, SMOKE_BENCH_PROMPT, 48, pc.topk)
     print(f"[bench prompt] {len(g['prompt_ids'])} tokens", file=sys.stderr)
     p.report(st, out=lambda s: print(s, file=sys.stderr))
@@ -217,7 +242,7 @@ def cmd_smoke(a):
     if [x["prompt_ids"] for x in old["prompts"]] != [x["prompt_ids"] for x in rec["prompts"]]:
         raise SystemExit(f"{path}: prompts/tokenizer changed; re-create with --update-golden")
 
-    ok = True
+    ok = spec_ok
     for o, n in zip(old["prompts"], rec["prompts"]):
         same = o["tokens"] == n["tokens"]
         ok &= same
@@ -260,6 +285,9 @@ def main(argv=None):
     s.add_argument("--prompt"); s.add_argument("--prompt-file"); s.add_argument("--ids"); s.add_argument("--chat", action="store_true"); s.add_argument("--system")
     s.add_argument("--max-new", type=int, default=128); s.add_argument("--temperature", type=float, default=0.0); s.add_argument("--top-p", type=float, default=1.0)
     s.add_argument("--seed", type=int); s.add_argument("--stop-id", action="append"); s.add_argument("--bench", action="store_true"); s.add_argument("--json")
+    s.add_argument("--spec", action="store_true", help="speculative decode with prompt-lookup (n-gram) drafting")
+    s.add_argument("--spec-k", type=int, default=3, help="drafts per verify round (capped by the stages' spec_k)")
+    s.add_argument("--spec-match", type=int, default=2, help="n-gram match length for prompt-lookup drafting")
     s.set_defaults(fn=cmd_generate)
 
     s = sp.add_parser("smoke", help="<90 s correctness gate: ping, two greedy prompts, top-k logits, one bench"); pl(s)
