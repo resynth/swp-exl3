@@ -1,20 +1,30 @@
 # Razer (Ubuntu 24.04, upstream exllamav3 1.6.4, CUDA, 16 GB VRAM + 64 GB RAM). EXAMPLE VALUES.
+# Copy to the machine and set model_dir/listen:
+#   cp examples/stage-razer.toml ~/models/stage-razer.toml
+#   swp-exl3 config-check --config ~/models/stage-razer.toml --template examples/stage-razer.toml
+# Kyojin-only flags (SPEED_ENV, EXL3_VERIFY_ROW_SPLIT) do not apply here: upstream exllamav3 ignores them.
 [stage]
 node = "razer"
 listen = "0.0.0.0:7801"
 secret_env = "SWP_SECRET"
-model_dir = "/models/glm53-razer-slice"      # produced by: swp-exl3 pull --server strix:7700 ... --first
-layers = [0, 20]
+model_dir = "/models/glm53-razer-slice"      # machine-local: produced by: swp-exl3 pull --server strix:7700 ... --first
+layers = [0, 7]                              # [first, end): the reference pair is Razer [0, 7) + Strix [7, 45)
 embed = true
 head = false
 device = "cuda:0"
-cache_tokens = 16384
-max_chunk = 512
+cache_tokens = 16384                 # machine-local: KV/state cache, multiple of 256
+max_chunk = 2048                     # rows per FORWARD; 2048 measured (RESULTS.md task 7); 4096 is not worth it (T6 gate)
 wire_dtypes = ["f32", "bf16"]
 cache_bits = 0                       # 0 = fp16 KV cache; 8 = packed int8 KV (CacheLayer_quant, longer context)
-spec_k = 3                           # speculative draft window (verify rollback); 0 disables
+spec_k = 8                           # speculative draft window (verify rollback); caps the pair at min(spec_k) of the stages
 
-# Set on config.infer_params before the model is built (upstream 1.6.x CPU expert offload).
+# Upstream exllamav3 flags for this stage. EXL3_HC_FOLD enables the folded/deferred hyper-connection path
+# (validated performance-neutral on this hardware, RESULTS.md Task 3).
+[stage.env]
+EXL3_HC_FOLD = "1"
+
+# Optional: CPU expert offload, set on config.infer_params before the model is built (upstream 1.6.x).
 # Use ONE of: moe_cpu_offload = N MoE layers fully on CPU, or moe_cpu_split = N experts per layer on CPU.
-[stage.engine]
-moe_cpu_offload = 10
+# [stage.engine]
+# moe_cpu_offload = 10
+
