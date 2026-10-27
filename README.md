@@ -545,6 +545,13 @@ them; check these first when a previously working pair fails to start.
   `extra_cuda_cflags`) — this lives in the dependency checkout, so a re-clone loses it. Torch only
   appends its own `-std=c++17` when the nvcc command has no `-std=` flag, so carrying `-std=c++20`
   suppresses the override.
+* **Stale precompiled Kyojin extension (update killer).** `exllamav3/ext.py` prefers an already
+  importable `exllamav3_ext` module over rebuilding: after a Kyojin pull, a leftover built
+  `exllamav3_ext*.so` in the engine repo root (or in site-packages) is still loaded and the fresh
+  sources are silently ignored — the engine then dies at first forward with a pybind
+  `TypeError: <kernel>(): incompatible function arguments` (plus a "… not in this extension build"
+  warning). Move/remove the `.so` and wipe the torch extension cache (`~/.cache/torch_extensions/py<XY>_<sdk>/exllamav3_ext`)
+  so the next import JIT-builds the new code.
 * **Stale torch-extension build lock.** If `import exllamav3` hangs, delete
   `~/.cache/torch_extensions/py<XY>_cu<NNN>/exllamav3_ext/lock`. This torch's `FileBaton` waits while
   the lock file merely exists (`O_CREAT|O_EXCL`), so a lock left by an interrupted build blocks import

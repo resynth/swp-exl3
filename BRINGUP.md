@@ -512,4 +512,101 @@ cut-7/no-offload), and prefill 59 → 217 tok/s. The Strix is now clearly the bo
 Configs: `~/models/stage-310-razer-k7.toml`, `~/models/pipeline-310-k7.toml`,
 `/home/m/swp/stage-310-strix-k7.toml`.
 
+---
+
+## 13. Follow-up run 2 — Kyojin main updated 1.5.0 → 1.7.2 (2026-10-27)
+
+The Strix's Kyojin checkout (branch `feat/glm-kv-q8` @ `92bba81`, 1.5.x-era) was moved to `main` @
+`32123e5` (**1.7.2**), 251 commits past previous main. exllamav3 on the Razer untouched.
+
+### 13.1 How the update happened
+
+The Strix has no working name resolution / outbound path (`github.com` unreachable), so the update
+was done from the Razer, which has a Kyojin checkout at `~/ai/kyojin`:
+
+```bash
+# Razer:
+cd ~/ai/kyojin && git fetch origin
+git bundle create /tmp/kilo/kyojin-main.bundle 04720c1..origin/main      # 3.4 MB bundle
+scp /tmp/kilo/kyojin-main.bundle m@10.10.10.2:/tmp/
+# Strix:
+cd ~/engines/kyojin && git checkout main
+git pull --ff-only /tmp/kyojin-main.bundle refs/remotes/origin/main
+```
+
+No venv changes were needed: 1.7.2's new declared deps (`llguidance`, `pydantic`, `aiohttp`,
+`marisa_trie`, …) were already installed, torch stayed `2.12.0a0+rocm7.13…`.
+
+### 13.2 New pitfall: the stale *precompiled* extension
+
+`exllamav3/ext.py` first calls `is_precompiled_extension_available()`, which does
+`find_spec("exllamav3_ext")` — and since stages run with the repo root on `sys.path` (PYTHONPATH +
+`cd`), a **real `.so` sitting in the repo root is found and imported directly, no rebuild**. Such a
+file existed there (`exllamav3_ext.cpython-314-…so`, dated Oct 14, built from the old 1.5.x source),
+so after the pull the engine silently ran the old ABI:
+
+* every forward crashed with `TypeError: cuda_recurrent_gated_delta_rule(): incompatible function
+  arguments …` (the Python side of 1.7.2 passes a new signature),
+* plus the `MLA VALU decode kernels not in this extension build: using the Triton path` warning,
+* and the whole traceback is drowned in raw tensor dumps — some code prints full CUDA tensors,
+  which made the failure look bizarre (the dumps are the *tail* of a `print(...)` of call args).
+
+**Fix** — move the stale prebuilt out of the repo root and let torch JIT-build the fresh sources
+into the extension cache:
+
+```bash
+mv ~/engines/kyojin/exllamav3_ext.cpython-314-*.so ~/engines/kyojin/exllamav3_ext.cpython-314.so.stale-1.5
+rm -rf ~/.cache/torch_extensions/py314_rocm71360980/exllamav3_ext
+# then any import (stage, doctor) triggers the real HIP build (~5 min for 71 objects)
+PYTHONPATH=/home/m/engines/kyojin ./.venv/bin/python -c "import exllamav3.ext as e; print(e.exllamav3_ext.__file__)"
+# -> ~/.cache/torch_extensions/py314_rocm71360980/exllamav3_ext/exllamav3_ext.so
+```
+
+The extension cache dir in §8's stale-lock warning is `py314_rocm71360980` on this machine. Any
+future Kyojin pull must also remove/move a repo-root `.so` first — the precompiled short-circuit
+wins over the source-vertex rebuild and masks API changes.
+
+### 13.3 Verification on 1.7.2
+
+| check | result |
+|---|---|
+| `tools/check_api_against_source.py` (Strix) | **61 passed, 1 failed** — same known cosmetic `Cache.__init__ has recurrent_dtype`; adapter skips it with a warning |
+| `swp-exl3 doctor` + dry-run slice `[7,45)` `--last` | **20 passed, 0 failed**; same boundary (`[4,4096]`, 64 KiB/row), 38 blocks, 10 cache layers; `CacheLayer_quant` (q8) and `block_sparse_mlp_cpu` both still present |
+| kyojin-server no-GPU suite (`test_swp_kyojin_server`, `KYOJIN_ROOT` at 1.7.2) | **9 tests, OK** (README says 11 methods in the file; 9 are collected) |
+| local suite (Razer) | **42 tests, all pass** |
+| `swp-exl3 speed-env --kyojin-root` | parses 1.7.2's `SPEED_ENV` fine |
+
+### 13.4 Measurements (Model B, cut 7, f32, chunk 2048, warm)
+
+| metric | Kyojin 1.5.0 | Kyojin 1.7.2 |
+|---|---|---|
+| smoke CLI decode | 14.88 tok/s | **15.14 / 15.13 / 15.08 tok/s** (3 runs) |
+| long generate decode (95 tok) | — | **15.13 tok/s** |
+| stage 0 compute/tok | 7.139 ms (11%) | 6.88–7.12 ms (10–11%) |
+| stage 1 compute/tok | 55.067 ms (82%) | 53.6–54.0 ms (81–82%) |
+| smoke prefill (149 tok) | 858.9 ms | 830.9–844 ms |
+| first/warm prefill ratio | — | 0.96–0.99× (stages pre-warmed) |
+
+Small consistent improvement (~1.5 % decode, ~2 % stage-1 compute, ~3 % prefill). Coherence
+preserved (the math prompt from §12 answers identically: "80 km/h" with the check step).
+
+### 13.5 Correctness vs the old golden, and q8
+
+`swp-exl3 smoke` against the **pre-update golden** (`pipeline-310-k7.golden.json`, created on 1.5.x):
+
+* logit row: **top-1 equal, 64/64 shared, max |Δ| 0.0156, KL 6.1e-06** (old cross-config KLs were
+  ~5e-5; this is tighter).
+* spec verify: 20 batched rows vs sequential — 0 top-1 mismatches, max KL 6.9e-3 (unchanged gate).
+* `capital` prompt reproduced all 48 greedy tokens exactly; `haiku` diverged at token 20
+  (golden "It should capture a…" → now "The first line has…"), both coherent — a near-tie flipped
+  by the new engine's rounding, not a numeric regression. The golden was regenerated on 1.7.2
+  (`--update-golden`); the follow-up smoke now passes with **KL 0.00e+00** (greedy is deterministic
+  per engine build).
+* `cache_bits = 8` survived into main: `stage-310-strix-k7-q8.toml` (65 536-token cache) loads
+  (`cache_gb 0.734`, 111.87 GB total, warmup incl. the known slow first quant-cache forward), runs
+  end-to-end at 14.84 tok/s. fp16 stage restored afterwards.
+
+Left running: Razer stage 0 `[0,7)` + Strix stage 1 `[7,45)` fp16 k7 (both session-scoped; §10
+runbook restarts them). q8 configs unchanged.
+
 
