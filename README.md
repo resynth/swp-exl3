@@ -45,7 +45,7 @@ stale lock at `~/.cache/torch_extensions/*/<ext>/lock` (this torch blocks while 
 Verified on the reference pair: **exllamav3 1.6.4** (Razer, CUDA 13.3) and **Kyojin 1.5.0** (Strix,
 ROCm 7.13). Local suite: `python -m unittest discover -s tests` → **42 tests**, all pass with
 `SWP_WEIGHTD` set; 1 self-skips without it (the provisioning test). The Kyojin HTTP integration
-(`swp_exl3/integrations/kyojin-server/`) has a separate **9-test** no-GPU suite.
+(`swp_exl3/integrations/kyojin-server/`) has a separate **11-test** no-GPU suite.
 
 > Kyojin is often *not* pip-installed — its `serve.py` works from the repo root. Run `swp-exl3`
 > with the engine repo on `PYTHONPATH`, e.g.

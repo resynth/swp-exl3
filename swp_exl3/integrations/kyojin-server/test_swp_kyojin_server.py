@@ -208,6 +208,16 @@ class T(unittest.TestCase):
         self.assertEqual(ids.numel(), 3)
         self.assertEqual(ids.tolist(), enc("abc"))
 
+    def test_over_context_gets_400(self):
+        e = sks.PipelineEngine(self.pipe, self.tok, ctx=10, eos_ids=[63], seq_factory=lambda ids: list(ids),
+                               log=lambda *a: None)
+        app = kserve.create_app(e, "fake-model", TEMPLATE)
+        async def go():
+            async with TestClient(TestServer(app)) as c:
+                r = await self.post(c, [{"role": "user", "content": "x" * 40}], ignore_eos=True)
+                return r.status
+        self.assertEqual(run(go()), 400)
+
     def test_unsupported_sampler_options_warn_once(self):
         logs = []
         self.engine.log = logs.append

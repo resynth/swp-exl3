@@ -41,7 +41,7 @@ reply and the turn is replayed (expected).
     KYOJIN_ROOT=~/engines/kyojin SWP_EXL3_ROOT=~/swp-exl3 python -m unittest test_swp_kyojin_server -v
 Covers: endpoints, non-stream output equals a direct pipeline run, stream equals non-stream, stop strings, multi-turn
 append without replay, replay accounting on a trim (`cached_tokens = 0`, `replayed_tokens = kept`), exact-id splicing
-and its fallbacks, cancel mid-stream, one-time warning for unsupported samplers, and the terminal HIT/MISS/rate/spec line. 9 tests.
+and its fallbacks, cancel mid-stream, one-time warning for unsupported samplers, and the terminal HIT/MISS/rate/spec line. 11 tests.
 torch is stubbed only if it is not installed.
 
 ## Agent / chat-UI use
