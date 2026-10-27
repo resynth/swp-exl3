@@ -703,3 +703,141 @@ Prefill 1,576 warm 485.6 tok/s; `smoke` PASS.
 * Razer `~/models/stage-310-razer-k7.toml` and `-f16.toml`: `spec_k = 8` (backups `.bak-t4t6`).
 * Measurement configs: `~/models/pipeline-310-k7-local-rows.toml`,
   `~/models/stage-310-razer-k7-f16-sk8.toml`.
+
+## Verify-row flag sweep (2–4 rows) — no cheaper 2-row step, MTP stays gated
+
+**Question.** The verify curve's expensive step is 1→2 rows (~+45 ms for a 2-row verify over a
+~67 ms plain token). Can `EXL3_HIP_PREFILL_MIN_ROWS`, `EXL3_DEC_ROUTER_ROWS`, `EXL3_VERIFY_FUSE`, or
+`EXL3_MOE_CFG` cut the 2–4-row cost enough (~25–30%) to revive MTP?
+
+**Setup.** Model B cut 7, f32 wire, chunk 2048, stage 0 remote on the Razer, stage 1 restarted per arm
+with the arm's `[stage.env]` (all four flags are read at import or in C++ static init, so one process
+per arm). The 39-token code prompt is prefilled once; the coordinator then runs verify rounds with a
+*forced* greedy continuation as the drafter, so every round is exactly B = k+1 rows and B=2/B=4 accept
+100% and reproduce the plain text byte-for-byte. 48 new tokens, 2 runs per B, median. Base stage env is
+the Task A `SPEED_ENV` plus `EXL3_VERIFY_ROW_SPLIT=2`; `EXL3_VERIFY_FUSE=1`, `MIN_ROWS=2`,
+`DEC_ROUTER_ROWS=2`, `MOE_CFG=2` are the base values.
+
+| arm | change | B=2 ms | B=3 ms | B=4 ms | stage-1 B=2 / B=4 |
+|---|---|---|---|---|---|
+| **base** (3 controls, session start/middle/end) | — | **114.9** | **142.0** | **166.3** | 100.9 / 149.4 |
+| `MIN_ROWS=3` | 2 rows use the decode kernel | 115.5 | 143.9 | 165.0 | 100.7 / 147.8 |
+| `MIN_ROWS=4` | 2–3 rows use the decode kernel | 117.0 | 143.7 | 165.4 | 102.5 / 148.0 |
+| `MIN_ROWS=17` | all ≤16 rows use the decode kernel | 113.1 / 114.2 | 138.7 / 142.3 | 161.8 / 164.5 | 98.6–100.6 / 143.9–146.9 |
+| `DEC_ROUTER_ROWS=1` | one router launch per row | 113.0 | 137.7 | 162.8 | 98.7 / 145.2 |
+| `DEC_ROUTER_ROWS=0` | batch-1 router path | 113.8 | 139.7 | 162.0 | 99.2 / 144.7 |
+| `VERIFY_FUSE=0` | no fused R-row verify linears | 115.5 | 141.3 | 162.6 | 101.2 / 145.2 |
+| `MOE_CFG=1` | 256-thread grouped decode | 114.4 | 140.8 | 162.4 | 99.9 / 146.4 |
+| `MOE_CFG=0` | 512-thread grouped decode | 115.8 | 142.6 | 163.2 | 101.5 / 145.7 |
+
+Controls at the end of the session measured 114.9/142.0/166.3 and 116.2/143.8/168.2; the session
+drifted ~1–2 ms at B=2 and ~2–6 ms at B=4. **Every requested flag is therefore within run-to-run
+drift of the base.** The only consistent effect is `VERIFY_FUSE=1` being ~1–2 ms better at B=2
+(the Kyojin note measured −3.0 ms at R=2); it is already on. `MIN_ROWS=2` (the grouped prefill path
+at 2 rows) is already the best of 2/3/4/17; the decode kernel is not faster.
+
+**Adjacent knobs, same setup (all neutral or worse).**
+
+| arm | B=2 | B=3 | B=4 |
+|---|---|---|---|
+| `MOE_PREFILL_CFG=1` | 113.6 | 137.6 | 161.2 |
+| `MIN_ROWS=17` + `MOE_CFG=1` | 117.0 | 144.5 | 168.2 |
+| `MOE_VALU=1` | 117.1 | 145.5 | 166.0 |
+| `VERIFY_GEMV_R=1` | 117.9 | 147.4 | 168.7 |
+| `MOE_UNION_V2=0` | 117.1 | 144.7 | 168.0 |
+| `DEC_MOE_UNION=1` | 117.3 | 145.4 | 169.9 |
+| `DEC_GEMV_R_LOOP_MIN_K=4` | 114.5 | 141.8 | 163.2 |
+| `DEC_GEMV_R_LOOP_MIN_K=6` | 117.1 | 143.3 | 169.6 |
+
+**Why nothing moves.** An early base run measured stage 1 at 55.4 / 100.1 / 122.5 / 144.6 ms at
+B=1/2/3/4: the first extra row costs **+44.7 ms**, the next two **+22.4 / +22.1 ms** each. That is
+consistent with the R=1 specialised batch-1 path (block graph, fused batch-1 kernels) being left behind
+at R=2, after which the generic multi-row path scales ~linearly. The requested flags choose kernels
+*inside* the R≥2 MoE/router path; none changes the path switch or the second row's real work (its
+distinct experts, MLA/KDA recurrence, dense projections). The dedup knobs (`MIN_ROWS=2`, `MOE_VALU`,
+union V2) produced no gain either, so the second row's expert set is not being recovered by
+deduplication here.
+
+**MTP arithmetic with the measured curve.** k=1 (B=2): 114.9 ms verify + S3's 4.7 ms drafter + 2.0 ms
+catch-up = 121.6 ms/round. At the measured depth-1 acceptance 70.4% that is 1.704 tokens/round →
+**14.0 tok/s** vs 15.0 plain. Matching plain needs a 113.5 ms round (verify ≤107 ms, −6.7%); 1.15x needs
+≤98.5 ms (verify ≤92 ms, −19%). The best arm (113.0 ms verify) gives 14.2 tok/s. k=3 (B=4): 162.2 ms
+verify + 12.9 ms drafter = 175.1 ms for 2.65 tokens → 15.1 tok/s (1.01x); 1.15x needs ≤153 ms
+(−12.5%), and the best arm is 161.2 ms. **No flag reaches the gate; keep `mtp = false`.**
+
+**Correctness.** `swp-exl3 smoke` on the base stage: PASS (both 48-token prompts token-identical to the
+golden, top-64 logits top-1 equal, 64/64 shared, KL 0). `spec_check` on the same prompt: k=1/2/3 all
+top-1 equal, 0/12 mismatches, max KL 2.9e-3 / 5.1e-4 / 5.2e-3. The forced B=3 run hit a near-tie and
+cascaded (18/58 accepted) on every arm; `spec_check` stays top-1-equal, so it is the known
+batched-kernel floor, not a flag effect.
+
+**Files.** Sweep configs on the Strix: `/home/m/swp/sweep/{base,min3,min4,min17,router0,router1, ...}.toml`;
+harness `/tmp/kilo/row_sweep.py` and results `/tmp/kilo/sweep-*.json` (measurement helpers, outside the
+repo). No live stage config was changed; the flags under test stay at their base values.
+
+## Long verify windows (12–32 rows): 16 rows exact, 32 rows fast, 24 rows is a trough
+
+**Setup.** Model B cut 7, f32, chunk 2048, `spec_k = 32` on both stages so `max_history` rises to 33
+(the Strix's recurrent cache grows 1.19 → 4.04 GB; 10.99 GB free after load). The single-round probe
+resets, prefills the 39-token code prompt, issues **one** B-row verify with the known greedy
+continuation, and resets again; 3 runs per B, so a rejected row cannot cascade. End-to-end uses
+`swp-exl3 generate --spec` on an 84-token repeated-paragraph prompt, 128 greedy tokens; plain is
+14.63 tok/s and every spec output is byte-identical to it.
+
+Single-round B-row verify (stage 1, `EXL3_VERIFY_ROW_SPLIT=2`):
+
+| B | 8 | 12 | 16 | 18 | 24 | 30 | 32 |
+|---|---|---|---|---|---|---|---|
+| verify wall ms | 235.3 | 320.4 | 391.0 | 565.8 | 645.6 | 719.3 | **533.6** |
+| stage-1 ms | 213.9 | 288.5 | 353.5 | 520.3 | 594.7 | 661.0 | 474.7 |
+| B / wall (tok/s if all kept) | 34.0 | 37.5 | 40.9 | 31.8 | 37.2 | 41.7 | **60.0** |
+
+The fine 8..32 step-2 sweep is in `/tmp/kilo/curve-fine.json`; the shape is piecewise, not a smooth
+flattening:
+
+* **8 → 16 rows: ~19.5 ms per extra row**, essentially the same slope as 2 → 4 (20–22 ms). The
+  per-row cost does **not** fall as more experts are touched.
+* **16 → 18 rows: +175 ms for two rows**. 18 → 30 is then ~12.8 ms/row, but the whole 17–30 region
+  carries a large fixed penalty.
+* **30 → 32 rows: −186 ms**. B=32 is faster than B=24 and B=30. B=24 is a local trough:
+  37.2 tok/s versus 40.9 at B=16 and 60.0 at B=32 (B=18 is the lowest in the 18–30 band at 31.8).
+
+The shape points to the engine's 16-row chunk boundary, not a gradual expert-saturation curve: 16 and 32 are full
+16-row chunks (fast), 17–30 pay for a partial tail, and 24 (16+8) is the worst. The expected unique
+expert count at 32 rows is only ~171 of 288 (about 5.3 new experts/row instead of 8), well short of
+saturation, yet B=32 is the fastest point; the discontinuity is the kernel's chunk/GEMM tiling.
+`ROW_SPLIT=0/1` produced the same shape (B=16 381.6/381.9 ms, B=24 638/641 ms, B=32 525/525 ms versus
+391.0/645.6/533.6 with =2), so the row-split mode is not the cause. =1 is ~1–2% faster at B≥16 but
+remains worse at B=6–7 (T6); do not change the default without re-running those points.
+
+**End-to-end, 100% n-gram acceptance on the repeated paragraph (128 tok, greedy):**
+
+| k | B | rounds | accepted | decode tok/s | vs plain | output |
+|---|---|---|---|---|---|---|
+| 11 | 12 | 11 | 121/121 | 37.2 | 2.54x | identical |
+| **15** | **16** | **8** | **120/120** | **43.5** | **2.97x** | **identical** |
+| 23 | 24 | 6 | 138/138 | 34.9 | 2.38x | identical |
+| **31** | **32** | **4** | **124/124** | **63.4** | **4.33x** | **identical** |
+
+Repeatable: k=15 43.50/43.37, k=23 34.87/34.75, k=31 63.34/63.70 (two extra runs each). The
+throughput gain comes from amortising the per-token fixed cost: the marginal row is ~13–20 ms while
+a plain decode token is ~66 ms, so even linear rows win; B=32 wins much more because it is a full
+two-chunk alignment.
+
+**Correctness.** `spec_check` at k=15 (B=16) is top-1 equal 32/32 on both "The capital of France is"
+and the repeated paragraph. At k=31 (B=32) it is 32/32 on the paragraph (0 mismatches, KL 3.3e-4) but
+**31/32 on the capital prompt** (1 top-1 mismatch, KL 2.2e-3), and the code prompt in the single-round
+probe accepted 27/31. So **B=16 is the safe long-window default** (exact on everything tested, 43.5
+tok/s); **B=32 is the fast path for highly constrained repetitive output** (63.4 tok/s) but is not
+universally bit-identical to sequential decode. B=24 is slower than B=16 and buys no correctness, so
+avoid it.
+
+**MTP is unaffected:** its k=1/3 rounds are B=2/4, far from the long-window regime; the MTP gate in
+the previous section still stands. The long-window upside belongs to n-gram lookups with long exact
+matches (code blocks, quoted lists, repeated paragraphs).
+
+**Configs/memory.** Razer `~/models/stage-310-razer-k7-f16-sk32.toml`; Strix
+`/home/m/swp/sweep/long32{,-split1,-nosplit}.toml`; probe `/tmp/kilo/row_once.py`, results
+`/tmp/kilo/curve-{fine,once,nosplit,split1}.json`, end-to-end logs `/tmp/kilo/spec*-para*.{txt,err}`.
+Raising `spec_k` to 16/32 on both stages is a config change only; the live `spec_k = 8` files were not
+modified.
