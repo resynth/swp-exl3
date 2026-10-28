@@ -43,7 +43,7 @@ JIT-compile its CUDA/HIP extension on first use (minutes); if `import exllamav3`
 stale lock at `~/.cache/torch_extensions/*/<ext>/lock` (this torch blocks while the file exists).
 
 Verified on the reference pair: **exllamav3 1.6.4** (Razer, CUDA 13.3) and **Kyojin 1.5.0** (Strix,
-ROCm 7.13). Local suite: `python -m unittest discover -s tests` → **55 tests**, all pass with
+ROCm 7.13). Local suite: `python -m unittest discover -s tests` → **58 tests**, all pass with
 `SWP_WEIGHTD` set; 1 self-skips without it (the provisioning test). The Kyojin HTTP integration
 (`swp_exl3/integrations/kyojin-server/`) has a separate **16-test** no-GPU suite.
 
@@ -501,10 +501,12 @@ Throughput at long context (Model B, cut 7, chunk 2048, fp16 on Razer):
 | 131,072 | fp16 | 443.5 | 11.27 |
 | 131,072 | q8 | 414.5 | 9.40 |
 
-For long prompts, size the cache for **prompt + generation + spec window** (a forward past
-`cache_tokens` is now rejected as `context_exceeded`), and keep headroom: prefill workspace grows with
-`chunk × context`, and the 832k q8 config could not prefill 128k tokens at chunk 2048 even though it
-loaded. The 128k rows above use a 256k cache. Full tables and caveats are in `RESULTS.md` T5.
+For long prompts, size the cache for **prompt + generation** (a forward past `cache_tokens` is still
+rejected as `context_exceeded`). Speculative verify and MTP draft windows are clamped to the remaining
+cache, so a verify near the end cannot fail before plain decode would; keep headroom for prefill
+workspace, which grows with `chunk × context`, and note that the 832k q8 config could not prefill 128k
+tokens at chunk 2048 even though it loaded. The 128k rows above use a 256k cache. Full tables and caveats
+are in `RESULTS.md` T5.
 
 ---
 
@@ -542,7 +544,9 @@ Hybrid KDA linear attention (recurrent state) + MLA/DSA, MoE, **mHC hyper-connec
   was byte-identical to plain greedy on the repetitive runs; a novel-prose run can still diverge on a
   batched-verify near-tie, and MTP output is not guaranteed to be. On long novel prose, 2-token matches
   can be plentiful but weak (40 rounds, 8/120 accepted at 8k), which suppresses MTP; a strict 3/4-gram
-  floor is planned (RESULTS.md, "MTP as the n-gram fallback"). A plain
+  floor is planned (RESULTS.md, "MTP as the n-gram fallback"). Both the verify and MTP draft windows are
+  clamped to the remaining stage cache, so speculation does not need extra context beyond plain
+  prompt + generation. A plain
   batched prefill shows the same class of delta — it is the engines' batched kernels, not SWP. No prefill
   pipelining across stages; star topology (coordinator relays).
 * **MTP drafting is the fallback under `--spec`** (head stage only; `mtp = true`; needs Kyojin's

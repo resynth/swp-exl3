@@ -955,6 +955,13 @@ check `pos + rows` against its cache with a clear error. The drafter mirrors the
 one overflows on a long prompt. `examples/stage-strix.toml` keeps its 64k cache and pairs
 `mtp_cache_tokens` at 64k; the measured 8k MTP profile sets both to 8192.
 
+**Draft-window clamp.** `STAGE_READY` now advertises each stage's `cache_tokens`; the coordinator uses
+the smallest value. Before every round it caps the n-gram/MTP draft list to
+`cache_tokens - (len(history) + 1)`, and caps the next MTP roll to leave one row for the next verify
+(worst case: every draft accepted). A speculative round therefore never needs more rows than plain
+decode; a request whose prompt + generation genuinely exceeds the cache still returns the real
+`context_exceeded` error.
+
 **Smoke gate.** The spec line now classifies a top-1 mismatch as a near-tie when the verify top-1 is in
 the reference top-k and the reference top-1 is within 0.1 logits. The gate is zero non-near-tie flips,
 KL <= 1e-2, and near-ties capped at 10% of rows (at least one); the count and budget are printed. This
@@ -965,8 +972,9 @@ floor: the pre-marker engine fails the same way at k=2/4.
 **Live validation (cache 8192, MTP loaded).** Razer `[0,7)` + Strix `[7,45)`, f32, chunk 2048,
 `mtp = true`, `mtp_cache_tokens = 8192` (both stages cache 8192). Short prompts: the 149-token smoke
 prompt and a 42-token repetitive code prompt, 48 new tokens. The 8k rows use an 8000-token prompt + 128
-new (8128 total) so the verify window fits; a pure 8192-token prompt with cache 8192 cannot generate
-(an 8064+128 spec attempt failed at `forward needs 8193`).
+new (8128 total). A pure 8192-token prompt cannot generate with cache 8192; the earlier 8064+128 spec
+attempt failed at `forward needs 8193`, which the draft-window clamp below fixes (the same run now
+completes normally).
 
 | test | plain PP / TG tok/s | `--spec` PP / TG tok/s | spec mix |
 |---|---|---|---|
@@ -979,6 +987,9 @@ Pure 8192-token prefill (`--max-new 1`): **433.3 tok/s novel**, **478.7 tok/s re
 
 * The MTP fallback works: the short novel run used 17 MTP rounds (17/34 accepted) after the n-gram
   lookup missed, and reached 1.32x plain.
+* Draft-window clamp: the previously failing 8064+128 spec run now completes (127 new tokens,
+  14.59 tok/s, 80 rounds, no `context_exceeded`); the last verify/MTP windows are shortened
+  automatically.
 * Repetitive output is byte-identical to plain at both 42 and 8k tokens.
 * The 8k novel spec row is slightly **slower** than plain. The mix explains it: 40 n-gram rounds
   proposed 120 drafts but accepted only 8 (6.7%), and every hit suppressed MTP. The MTP rounds themselves

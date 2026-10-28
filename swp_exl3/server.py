@@ -129,6 +129,7 @@ class StageServer:
         self.session, self.wire = h.get("session", "s"), wd
         return swp.STAGE_READY, seq, {"session": self.session, "cache_len": 0, "tail": list(b.tail),
                                       "contract_hash": contract_hash(b.contract), "memory": getattr(b, "memory", {}),
+                                      "cache_tokens": int(getattr(b, "cache_tokens", 0) or 0),
                                       "spec": bool(getattr(b, "supports_spec", False)), "spec_k": int(getattr(b, "spec_k", 0)),
                                       "mtp": bool(getattr(b, "supports_mtp", False))}, b""
 

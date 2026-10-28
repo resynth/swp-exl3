@@ -204,6 +204,46 @@ class T(unittest.TestCase):
         ok, _ = spec_gate({"rows": 20, "bad_top1": 0, "near_tie_flips": 0, "max_kl": 2e-2})
         self.assertFalse(ok)
 
+    def test_drafts_clamped_to_cache_at_the_end(self):
+        # cache 17 = prompt(11) + 6 rows: max_new 7 plain needs exactly 17. A full k=3 verify at
+        # start 15 would need 19 rows, so the coordinator must clamp the window instead of failing.
+        ref = reference([4], PROMPT, 7, cache_tokens=17)
+
+        def drafter(context, k):
+            i = len(context) - len(PROMPT)
+            return [ref[i + j] for j in range(min(k, len(ref) - i))]
+
+        p, _ = pipe([4], cache_tokens=17)
+        got, st = p.generate(PROMPT, max_new=7, spec=SpecConfig(k=3, drafter=drafter))
+        self.assertEqual(got, ref)
+        self.assertGreater(st["spec_rounds"], 0)
+
+    def test_draft_room_leaves_a_row_for_the_next_verify(self):
+        p, _ = pipe([4], cache_tokens=17)
+        p.history = list(range(11))
+        self.assertEqual(p._draft_room(), 5)          # 11 + 1 + 5 == 17
+        self.assertEqual(p._next_draft_room(3), 1)    # next verify starts at 15 and needs 15+1+1
+        p.history = list(range(16))
+        self.assertEqual(p._draft_room(), 0)
+        self.assertEqual(p._next_draft_room(0), 0)
+
+    def test_mtp_fallback_stays_exact_with_a_small_cache(self):
+        ref = reference([4], PROMPT, 7, cache_tokens=17)
+        calls = []
+
+        def plan(pos, k):
+            calls.append((pos, k))
+            i = pos - len(PROMPT)
+            return [ref[i + j] for j in range(min(k, len(ref) - i))] if 0 <= i < len(ref) else []
+
+        p, _ = pipe([4], cache_tokens=17, mtp_plan=plan)
+        got, st = p.generate(PROMPT, max_new=7,
+                             spec=SpecConfig(k=3, mtp_k=2, drafter=lambda c, k: []))
+        self.assertEqual(got, ref)
+        self.assertGreater(st["spec_mtp_rounds"], 0)
+        self.assertTrue(calls)
+        self.assertLessEqual(max(k for _, k in calls), 2)
+
     def test_ngram_drafts(self):
         self.assertEqual(ngram_drafts([1, 2, 3, 4, 1, 2, 3], 2, 3), [4, 1])
         self.assertEqual(ngram_drafts([1, 2, 3], 2, 2), [])

@@ -10,12 +10,13 @@ PROMPT = [5, 17, 3, 42, 9, 60, 21, 8, 33, 12, 1]
 LOG = lambda *a: None
 
 
-def start(cuts, recurrent=True, secret=None, delays=None, fails=None, n_layers=8, **be_kw):
+def start(cuts, recurrent=True, secret=None, delays=None, fails=None, n_layers=8, cache_tokens=0, **be_kw):
     edges = [0] + list(cuts) + [n_layers]
     servers, specs = [], []
     for i in range(len(edges) - 1):
         be = FakeBackend((edges[i], edges[i + 1]), n_layers=n_layers, recurrent=recurrent,
                          delay_ms=(delays or [0] * 9)[i], fail_calls=(fails or {}).get(i, ()), **be_kw)
+        be.cache_tokens = int(cache_tokens)
         s = StageServer(be, f"n{i}", "127.0.0.1:0", secret=secret, log=LOG)
         s.bind()
         threading.Thread(target=s.serve_forever, daemon=True).start()
@@ -24,8 +25,8 @@ def start(cuts, recurrent=True, secret=None, delays=None, fails=None, n_layers=8
     return servers, specs
 
 
-def pipe(cuts, secret=None, chunk=512, wire="f32", **kw):
-    servers, specs = start(cuts, secret=secret, **kw)
+def pipe(cuts, secret=None, chunk=512, wire="f32", cache_tokens=0, **kw):
+    servers, specs = start(cuts, secret=secret, cache_tokens=cache_tokens, **kw)
     p = Pipeline(specs, secret=secret, chunk=chunk, wire_dtype=wire, log=LOG)
     p.connect()
     return p, servers

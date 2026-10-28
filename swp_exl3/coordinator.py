@@ -110,6 +110,7 @@ class Pipeline:
         self.peers, self.history, self.step, self.tail = [], [], 0, None
         self.replayed_tokens = 0        # tokens recomputed by clear+replay (prefix reuse lost)
         self.spec_k = 0                  # largest draft window every stage advertised (0 = no speculation)
+        self.cache_tokens = 0            # smallest stage cache (0 = unknown; draft clamping disabled)
         self.head_mtp = False            # head stage can propose next-round drafts after a verify/decode
         self.last_extra = {}             # head reply fields that are not the payload (drafts, basis, ...)
         self.stage_configs = (list(stage_configs or []) + [None] * len(self.stages))[:len(self.stages)]
@@ -134,7 +135,7 @@ class Pipeline:
     def connect(self):
         self.close()
         n = len(self.stages)
-        spec_ks, head_ready = [], {}
+        spec_ks, cache_caps, head_ready = [], [], {}
         for i, s in enumerate(self.stages):
             if self.stage_configs[i]:
                 p = self._local.get(i)
@@ -148,10 +149,14 @@ class Pipeline:
                 "wire_dtype": self.wire, **({"contract": self.contract} if self.contract else {})}, want=swp.STAGE_READY)
             self.tail = ready.get("tail", self.tail)
             spec_ks.append(int(ready.get("spec_k", 0)))
+            cache_caps.append(int(ready.get("cache_tokens", 0) or 0))
             if i == n - 1:
                 head_ready = ready
             self.peers.append(p)
         self.spec_k = min(spec_ks) if spec_ks else 0
+        # The verify/roll window must fit every stage's cache. If any stage did not advertise one, leave
+        # clamping off rather than guess a limit that a different stage could exceed.
+        self.cache_tokens = min(cache_caps) if cache_caps and all(c > 0 for c in cache_caps) else 0
         self.head_mtp = bool(head_ready.get("mtp")) and self.spec_k > 0
         self.history = []
 
@@ -319,6 +324,19 @@ class Pipeline:
         out = self.feed(prompt_ids, want="topk", k=k)
         return out[1][0][0], out[1][1][0]
 
+    def _draft_room(self):
+        """Max drafts for a verify at the current history position, or None when the cache is unknown."""
+        if not self.cache_tokens:
+            return None
+        return max(0, int(self.cache_tokens) - len(self.history) - 1)
+
+    def _next_draft_room(self, sent):
+        """Max next-round drafts after a forward that carries `sent` drafts (worst case: all accepted).
+        The next verify starts at `len(history) + 1 + sent`, so this leaves one row for its own token."""
+        if not self.cache_tokens:
+            return None
+        return max(0, int(self.cache_tokens) - len(self.history) - 2 - int(sent))
+
     def _spec_loop(self, tok, want, top_k, max_new, temperature, top_p, stop_ids, spec, rng, on_token, pick):
         """Speculative decode: propose drafts, verify them in one k+1-row forward, emit the accepted prefix.
 
@@ -345,21 +363,28 @@ class Pipeline:
             if tok in stop_ids or len(gen) >= max_new:
                 break
             # Prefer a known continuation (prompt lookup) over the drafter: it is free and, on
-            # repetitive output, exact. MTP is the fallback for novel text.
-            lookup = spec.propose(self.history + [tok], k_ngram) if k_ngram else []
+            # repetitive output, exact. MTP is the fallback for novel text. Cap both windows to the rows
+            # the stage caches can still hold: a verify near the cache end must not turn a legal
+            # generation into a context_exceeded error.
+            room = self._draft_room()
+            k_ngram_round = k_ngram if room is None else min(k_ngram, room)
+            k_mtp_round = k_mtp if room is None else min(k_mtp, room)
+            lookup = spec.propose(self.history + [tok], k_ngram_round) if k_ngram_round else []
             if lookup:
                 st["spec_lookup_hits"] += 1
                 st["spec_lookup_len_total"] += len(lookup)
-                source, drafts, pending = "ngram", lookup[:k_ngram], []
-            elif k_mtp and pending:
-                source, drafts, pending = "mtp", pending[:k_mtp], []
+                source, drafts, pending = "ngram", lookup[:k_ngram_round], []
+            elif k_mtp_round and pending:
+                source, drafts, pending = "mtp", pending[:k_mtp_round], []
             else:
                 source, drafts = "plain", []
-            want_mtp = bool(self.head_mtp and k_mtp and want == "token" and source != "ngram")
+            next_room = self._next_draft_room(len(drafts))
+            draft_k_next = k_mtp if next_room is None else min(k_mtp, next_room)
+            want_mtp = bool(self.head_mtp and draft_k_next and want == "token" and source != "ngram")
             if not drafts:
                 extra = None
                 if want_mtp:
-                    extra = {"next_drafts": True, "draft_k": k_mtp,
+                    extra = {"next_drafts": True, "draft_k": draft_k_next,
                              "sampling": dict(sampler, round=st["spec_rounds"] + 1)}
                 out = self._relay_recover(len(self.history), [tok], want, "last", top_k, "decode",
                                           rewrite=True, extra=extra)
@@ -377,7 +402,7 @@ class Pipeline:
                      "sampling": dict(sampler, round=st["spec_rounds"] + 1),
                      "next_drafts": want_mtp}
             if want_mtp:
-                extra["draft_k"] = k_mtp
+                extra["draft_k"] = draft_k_next
             t_round = time.perf_counter()
             kind, data = self._relay_recover(len(self.history), [tok] + drafts, "spec", "all", top_k, "decode",
                                              rewrite=True, extra=extra)
