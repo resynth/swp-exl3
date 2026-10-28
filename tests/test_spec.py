@@ -123,6 +123,87 @@ class T(unittest.TestCase):
         got, st = p.generate(PROMPT, max_new=10, spec=SpecConfig(k=3))
         self.assertEqual(got, reference([4], PROMPT, 10))
 
+    def test_mtp_fallback_uses_mtp_k_when_ngram_k_is_larger(self):
+        # The two windows are independent: an n-gram window of 3 must not make the MTP fallback ask for 3.
+        ref = reference([4], PROMPT, 18)
+        asked = []
+
+        def plan(pos, k):
+            asked.append(int(k))
+            i = pos - len(PROMPT)
+            return ref[i:i + k] if 0 <= i < len(ref) else []
+
+        p, _ = pipe([4], mtp_plan=plan)
+        got, st = p.generate(PROMPT, max_new=14,
+                             spec=SpecConfig(k=3, mtp_k=2, drafter=lambda c, k: []))
+        self.assertEqual(got, ref[:14])
+        self.assertGreater(st["spec_mtp_rounds"], 0)
+        self.assertGreater(st["spec_mtp_drafted"], 0)
+        self.assertTrue(asked)
+        self.assertLessEqual(max(asked), 2, asked)
+
+    def test_ngram_hit_discards_pending_mtp(self):
+        ref = reference([4], PROMPT, 16)
+
+        def plan(pos, k):
+            i = pos - len(PROMPT)
+            return ref[i:i + k] if 0 <= i < len(ref) else []
+
+        def drafter(context, k):
+            i = len(context) - len(PROMPT)
+            return [ref[i + j] for j in range(min(k, len(ref) - i))]
+
+        p, _ = pipe([4], mtp_plan=plan)
+        got, st = p.generate(PROMPT, max_new=12,
+                             spec=SpecConfig(k=3, mtp_k=2, drafter=drafter))
+        self.assertEqual(got, ref[:12])
+        self.assertGreater(st["spec_ngram_rounds"], 0)
+        self.assertEqual(st["spec_mtp_rounds"], 0)
+        self.assertEqual(st["spec_mtp_drafts"], 0)
+
+    def test_source_counters_sum_to_totals(self):
+        st = self._scripted([2, 5], PROMPT, 16, lambda i, k: i % 3)
+        self.assertEqual(st["spec_ngram_rounds"] + st["spec_mtp_rounds"] + st["spec_plain_rounds"],
+                         st["spec_rounds"])
+        self.assertEqual(st["spec_ngram_drafted"] + st["spec_mtp_drafted"], st["spec_drafted"])
+        self.assertEqual(st["spec_ngram_accepted"] + st["spec_mtp_accepted"], st["spec_accepted"])
+        self.assertEqual(st["spec_lookup_hits"] > 0, st["spec_ngram_rounds"] > 0)
+
+    def test_use_mtp_false_stays_exact_and_plain(self):
+        ref = reference([4], PROMPT, 12)
+        p, _ = pipe([4], mtp_plan=lambda pos, k: [])
+        got, st = p.generate(PROMPT, max_new=12,
+                             spec=SpecConfig(k=3, mtp_k=2, use_mtp=False, drafter=lambda c, k: []))
+        self.assertEqual(got, ref[:12])
+        self.assertEqual(st["spec_mtp_rounds"], 0)
+        self.assertEqual(st["spec_mtp_drafts"], 0)
+        self.assertGreater(st["spec_plain_rounds"], 0)
+
+    def test_near_tie_classifier(self):
+        from swp_exl3.coordinator import compare_topk
+        # reference top-1 (5) vs verify top-1 (7), 0.05 logits apart -> near-tie
+        c = compare_topk([7, 5, 3], [9.95, 10.0, 8.0], [5, 7, 3], [10.0, 9.95, 8.0])
+        self.assertFalse(c["top1_equal"])
+        self.assertTrue(c["near_tie"])
+        # 0.5 logits apart -> a real mismatch
+        c = compare_topk([7, 5, 3], [9.5, 10.0, 8.0], [5, 7, 3], [10.0, 9.5, 8.0])
+        self.assertFalse(c["near_tie"])
+        # verify top-1 outside the reference top-k cannot be a near-tie
+        c = compare_topk([11, 5, 3], [10.0, 9.0, 8.0], [5, 7, 3], [10.0, 9.5, 8.0])
+        self.assertFalse(c["near_tie"])
+
+    def test_smoke_near_tie_budget(self):
+        from swp_exl3.cli import spec_gate
+        ok, budget = spec_gate({"rows": 20, "bad_top1": 0, "near_tie_flips": 2, "max_kl": 1e-3})
+        self.assertTrue(ok)
+        self.assertEqual(budget, 2)
+        ok, _ = spec_gate({"rows": 20, "bad_top1": 0, "near_tie_flips": 3, "max_kl": 1e-3})
+        self.assertFalse(ok, "a systematic near-tie pattern must fail")
+        ok, _ = spec_gate({"rows": 20, "bad_top1": 1, "near_tie_flips": 0, "max_kl": 1e-3})
+        self.assertFalse(ok)
+        ok, _ = spec_gate({"rows": 20, "bad_top1": 0, "near_tie_flips": 0, "max_kl": 2e-2})
+        self.assertFalse(ok)
+
     def test_ngram_drafts(self):
         self.assertEqual(ngram_drafts([1, 2, 3, 4, 1, 2, 3], 2, 3), [4, 1])
         self.assertEqual(ngram_drafts([1, 2, 3], 2, 2), [])

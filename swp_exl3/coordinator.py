@@ -27,9 +27,14 @@ def ngram_drafts(tokens, k, n=2):
 
 @dataclass
 class SpecConfig:
-    """Drafting policy for `Pipeline.generate(spec=...)`. `drafter(context, k)` overrides the n-gram lookup."""
+    """Drafting policy for `Pipeline.generate(spec=...)`. `drafter(context, k)` overrides the n-gram lookup.
+
+    n-gram (prompt lookup) is tried first with `k`; when it misses and `use_mtp` is true, the head stage's
+    MTP drafter fills the gap with at most `mtp_k` drafts (a separate, usually smaller window)."""
     k: int = 3
     match: int = 2
+    mtp_k: int = 2
+    use_mtp: bool = True
     accept: str = "argmax"                 # "argmax" (greedy) or "sample" (T>0: sample target, accept on equality)
     drafter: object = None
     seed: int = None
@@ -46,19 +51,30 @@ class SpecConfig:
         return []
 
 
-def compare_topk(ids_a, vals_a, ids_b, vals_b):
-    """Top-1 equality and KL over the shared top-k (renormalised). Same definition as `swp-exl3 compare`."""
+NEAR_TIE_LOGITS = 0.1
+
+
+def compare_topk(ids_a, vals_a, ids_b, vals_b, near_tie_logits=NEAR_TIE_LOGITS):
+    """Top-1 equality and KL over the shared top-k (renormalised). Same definition as `swp-exl3 compare`.
+
+    A top-1 mismatch is classified as a `near_tie` (not a functional failure) when the verify top-1 is in
+    the reference top-k and the reference top-1 is at most `near_tie_logits` above it: the batched verify
+    kernels round differently from 1-row decode, so an almost-equal pair can flip."""
     ia, va, ib, vb = (np.asarray(ids_a), np.asarray(vals_a, dtype=np.float64),
                       np.asarray(ids_b), np.asarray(vals_b, dtype=np.float64))
     common = [i for i in ia if i in set(ib.tolist())]
     da, db = dict(zip(ia.tolist(), va.tolist())), dict(zip(ib.tolist(), vb.tolist()))
+    top1_equal = bool(ia[0] == ib[0])
+    near_tie = bool(not top1_equal and int(ia[0]) in db and int(ib[0]) in db
+                    and float(db[int(ib[0])] - db[int(ia[0])]) <= near_tie_logits)
     if not common:
-        return {"top1_equal": bool(ia[0] == ib[0]), "shared": 0, "topk": len(ia), "max_abs": float("inf"), "kl": float("inf")}
+        return {"top1_equal": top1_equal, "near_tie": near_tie, "shared": 0, "topk": len(ia),
+                "max_abs": float("inf"), "kl": float("inf")}
     diffs = [abs(da[i] - db[i]) for i in common]
     pa = np.exp(np.array([da[i] for i in common]) - max(da[i] for i in common)); pa /= pa.sum()
     pb = np.exp(np.array([db[i] for i in common]) - max(db[i] for i in common)); pb /= pb.sum()
     kl = float((pa * np.log(pa / pb)).sum())
-    return {"top1_equal": bool(ia[0] == ib[0]), "shared": len(common), "topk": len(ia),
+    return {"top1_equal": top1_equal, "near_tie": near_tie, "shared": len(common), "topk": len(ia),
             "max_abs": float(max(diffs)), "kl": kl}
 
 
@@ -304,13 +320,23 @@ class Pipeline:
         return out[1][0][0], out[1][1][0]
 
     def _spec_loop(self, tok, want, top_k, max_new, temperature, top_p, stop_ids, spec, rng, on_token, pick):
-        """Speculative decode: propose k drafts, verify them in one k+1-row forward, emit the accepted prefix.
-        Drafts come from the head stage's MTP drafter when it supplies them, otherwise from the n-gram lookup."""
-        k = max(0, min(int(spec.k), int(self.spec_k)))
+        """Speculative decode: propose drafts, verify them in one k+1-row forward, emit the accepted prefix.
+
+        Draft source per round, in priority order: prompt lookup (n-gram, free and exact on repetitive
+        text), then the head stage's MTP drafter (novel text), then a plain 1-token decode. The two
+        windows are independent: n-gram uses `spec.k`, MTP uses `spec.mtp_k`."""
+        k_ngram = max(0, min(int(spec.k), int(self.spec_k)))
+        k_mtp = max(0, min(int(getattr(spec, "mtp_k", 0) or 0), int(self.spec_k))) \
+            if getattr(spec, "use_mtp", True) else 0
+        depth = max(k_ngram, k_mtp, 1)
         gen, pending = [], []
         st = {"spec_rounds": 0, "spec_drafted": 0, "spec_accepted": 0, "spec_mtp_drafts": 0,
-              "spec_verify_ms": 0.0, "spec_catchup_ms": 0.0, "spec_roll_ms": 0.0,
-              "spec_depth": [0] * max(k, 1)}
+              "spec_ngram_rounds": 0, "spec_ngram_drafted": 0, "spec_ngram_accepted": 0,
+              "spec_mtp_rounds": 0, "spec_mtp_drafted": 0, "spec_mtp_accepted": 0,
+              "spec_plain_rounds": 0, "spec_lookup_hits": 0, "spec_lookup_len_total": 0,
+              "spec_verify_ms": 0.0, "spec_ngram_verify_ms": 0.0, "spec_mtp_verify_ms": 0.0,
+              "spec_catchup_ms": 0.0, "spec_roll_ms": 0.0, "spec_mtp_roll_ms": 0.0,
+              "spec_depth": [0] * depth}
         sampler = {"temperature": temperature, "top_p": top_p, "top_k": top_k, "seed": int(spec.seed or 0)}
         while len(gen) < max_new:
             gen.append(tok)
@@ -320,17 +346,20 @@ class Pipeline:
                 break
             # Prefer a known continuation (prompt lookup) over the drafter: it is free and, on
             # repetitive output, exact. MTP is the fallback for novel text.
-            lookup = spec.propose(self.history + [tok], k)
+            lookup = spec.propose(self.history + [tok], k_ngram) if k_ngram else []
             if lookup:
-                drafts, pending = lookup[:k], []
+                st["spec_lookup_hits"] += 1
+                st["spec_lookup_len_total"] += len(lookup)
+                source, drafts, pending = "ngram", lookup[:k_ngram], []
+            elif k_mtp and pending:
+                source, drafts, pending = "mtp", pending[:k_mtp], []
             else:
-                drafts = pending[:k]
-                pending = []
-            want_mtp = bool(self.head_mtp and want == "token" and not lookup)
+                source, drafts = "plain", []
+            want_mtp = bool(self.head_mtp and k_mtp and want == "token" and source != "ngram")
             if not drafts:
                 extra = None
                 if want_mtp:
-                    extra = {"next_drafts": True, "draft_k": k,
+                    extra = {"next_drafts": True, "draft_k": k_mtp,
                              "sampling": dict(sampler, round=st["spec_rounds"] + 1)}
                 out = self._relay_recover(len(self.history), [tok], want, "last", top_k, "decode",
                                           rewrite=True, extra=extra)
@@ -338,28 +367,39 @@ class Pipeline:
                 tok = pick(out)
                 nxt = self.last_extra.get("drafts") or []
                 if nxt and self.last_extra.get("drafts_basis") == tok:
-                    pending = nxt[:k]
+                    pending = nxt[:k_mtp]
                     st["spec_mtp_drafts"] += len(pending)
+                st["spec_plain_rounds"] += 1
+                st["spec_rounds"] += 1
                 continue
             extra = {"mode": "verify", "draft_ids": drafts,
                      "accept": "argmax" if want == "token" else "sample",
                      "sampling": dict(sampler, round=st["spec_rounds"] + 1),
                      "next_drafts": want_mtp}
+            if want_mtp:
+                extra["draft_k"] = k_mtp
             t_round = time.perf_counter()
             kind, data = self._relay_recover(len(self.history), [tok] + drafts, "spec", "all", top_k, "decode",
                                              rewrite=True, extra=extra)
             if kind != "spec":
                 raise swp.SwpError("bad_reply", f"verify forward answered kind={kind}")
-            st["spec_verify_ms"] += (time.perf_counter() - t_round) * 1e3
+            verify_ms = (time.perf_counter() - t_round) * 1e3
+            st["spec_verify_ms"] += verify_ms
+            st[f"spec_{source}_verify_ms"] += verify_ms
             m, tokens = int(data["accepted"]), data["tokens"]
             if len(tokens) != m + 1:
                 raise swp.SwpError("bad_reply", f"spec reply has {len(tokens)} tokens for accepted={m}")
             tm = data.get("timing") or {}
             st["spec_catchup_ms"] += float(tm.get("catchup_ms", 0.0))
-            st["spec_roll_ms"] += float(tm.get("mtp_roll_ms", 0.0))
+            roll_ms = float(tm.get("mtp_roll_ms", 0.0))
+            st["spec_roll_ms"] += roll_ms
+            st["spec_mtp_roll_ms"] += roll_ms
             st["spec_rounds"] += 1
+            st[f"spec_{source}_rounds"] += 1
             st["spec_drafted"] += len(drafts)
+            st[f"spec_{source}_drafted"] += len(drafts)
             st["spec_accepted"] += m
+            st[f"spec_{source}_accepted"] += m
             for j in range(len(drafts)):
                 st["spec_depth"][j] += 1 if j < m else 0
             self.history += [tok] + drafts[:m]          # committed; rejected rows are rewound lazily next round
@@ -374,7 +414,7 @@ class Pipeline:
             tok = int(tokens[-1])                       # bonus: emitted at the top of the next round
             nxt = data.get("drafts") or []
             if nxt and data.get("drafts_basis") == tok:
-                pending = nxt[:k]
+                pending = nxt[:k_mtp]
                 st["spec_mtp_drafts"] += len(pending)
             if len(gen) >= max_new:
                 break
@@ -422,10 +462,12 @@ class Pipeline:
 
     def spec_check(self, prompt_ids, rows=20, k=3, klog=8):
         """Compare batched verify logits against sequential decode logits from the same state.
-        `rows` verify rows (whole rounds of k+1), all drafts accepted."""
+        `rows` verify rows (whole rounds of k+1), all drafts accepted. A top-1 flip is tolerated only
+        when it is a near-tie (reference top-1 within 0.1 logits); `bad_top1` counts real failures."""
         k = max(1, min(int(k), int(self.spec_k)))
         if self.spec_k <= 0:
-            return {"rows": 0, "top1": True, "max_kl": 0.0, "max_abs": 0.0, "k": 0, "skipped": True}
+            return {"rows": 0, "top1": True, "bad_top1": 0, "near_tie_flips": 0,
+                    "max_kl": 0.0, "max_abs": 0.0, "k": 0, "skipped": True}
         self.reset()
         out = self.feed(prompt_ids, want="topk", k=klog)
         seq = [(out[1][0][0].copy(), out[1][1][0].copy())]          # seq[i] predicts token i
@@ -437,7 +479,7 @@ class Pipeline:
             seq_tokens.append(int(o[1][0][0][0]))
         self.reset()
         self.feed(prompt_ids, want="none")
-        t, r, checked, bad_top1, max_kl, max_abs = seq_tokens[0], 0, 0, 0, 0.0, 0.0
+        t, r, checked, bad_top1, near_tie_flips, max_kl, max_abs = seq_tokens[0], 0, 0, 0, 0, 0.0, 0.0
         while checked < rows:
             kk = min(k, rows - checked - 1) if rows - checked > 1 else 0
             drafts = seq_tokens[r + 1:r + 1 + kk]
@@ -449,13 +491,17 @@ class Pipeline:
                 ref_i, ref_v = seq[r + 1 + j]
                 c = compare_topk(ids[j], vals[j], ref_i, ref_v)
                 checked += 1
-                bad_top1 += 0 if c["top1_equal"] else 1
+                if not c["top1_equal"]:
+                    if c["near_tie"]:
+                        near_tie_flips += 1
+                    else:
+                        bad_top1 += 1
                 max_kl, max_abs = max(max_kl, c["kl"]), max(max_abs, c["max_abs"])
             self.history += [t] + drafts
             r += kk + 1
             t = seq_tokens[r]
         return {"rows": checked, "top1": bad_top1 == 0, "bad_top1": bad_top1,
-                "max_kl": max_kl, "max_abs": max_abs, "k": k}
+                "near_tie_flips": near_tie_flips, "max_kl": max_kl, "max_abs": max_abs, "k": k}
 
     def report(self, stats, out=print):
         return self.trace.report(stats["prefill_tokens"], stats["prefill_ms"], max(stats["decode_tokens"], 1), stats["decode_ms"], out)

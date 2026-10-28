@@ -43,9 +43,9 @@ JIT-compile its CUDA/HIP extension on first use (minutes); if `import exllamav3`
 stale lock at `~/.cache/torch_extensions/*/<ext>/lock` (this torch blocks while the file exists).
 
 Verified on the reference pair: **exllamav3 1.6.4** (Razer, CUDA 13.3) and **Kyojin 1.5.0** (Strix,
-ROCm 7.13). Local suite: `python -m unittest discover -s tests` → **42 tests**, all pass with
+ROCm 7.13). Local suite: `python -m unittest discover -s tests` → **55 tests**, all pass with
 `SWP_WEIGHTD` set; 1 self-skips without it (the provisioning test). The Kyojin HTTP integration
-(`swp_exl3/integrations/kyojin-server/`) has a separate **11-test** no-GPU suite.
+(`swp_exl3/integrations/kyojin-server/`) has a separate **16-test** no-GPU suite.
 
 > Kyojin is often *not* pip-installed — its `serve.py` works from the repo root. Run `swp-exl3`
 > with the engine repo on `PYTHONPATH`, e.g.
@@ -65,7 +65,7 @@ cd ../splitwire && cargo build --release     # binaries in target/release/
 ### `swp-exl3 doctor` — check the engine, optionally dry-run a slice
 
 ```
-swp-exl3 doctor [--model-dir DIR] [--layers A B] [--first | --last]
+swp-exl3 doctor [--model-dir DIR] [--layers A B] [--first | --last] [--require-verify-fastpath]
 ```
 
 | argument | meaning |
@@ -88,6 +88,17 @@ When the engine ships `exllamav3.modules.block_sparse_mlp_cpu`, `doctor` also re
 offload knobs and their defaults (`moe_cpu_offload`, `moe_cpu_split`, `moe_cpu_threads`,
 `moe_cpu_pinned_arena`, `draft_moe_cpu_*`). An engine without that module gets a warning, not a
 failure, because not every build supports CPU offload.
+
+`doctor` also checks the two engine features speculation depends on:
+
+* **`verify fast path (dflash_verify)`** — scans the installed engine tree (`.py`, with a compiled
+  `.so`/`.pyd` fallback). A missing marker on an upstream-like build is a WARN (the generic multi-row
+  path is expected there); a missing marker on a Kyojin-like build (`exllamav3.modules.block_graph`) is
+  a FAIL, because verify forwards then silently take the slow generic route. `SWP_VERIFY_FASTPATH=0`
+  is reported as "marker present but disabled". Pass `--require-verify-fastpath` to make an absent
+  marker a FAIL on any engine.
+* **`MTP drafter API`** — `Glm5NextMTPModel.attach_to` and `sample_from_state`. Missing is a WARN
+  ("MTP unavailable; keep `mtp = false`"). The optional `eh_proj` sidecar path is printed when set.
 
 ### `swp-exl3 speed-env` — print Kyojin's engine flags as `[stage.env]`
 
@@ -198,7 +209,7 @@ swp-exl3 generate --pipeline FILE [--no-contract]
                   (--prompt TEXT | --prompt-file FILE | --ids a,b,c)
                   [--chat] [--system S] [--max-new N] [--temperature F] [--top-p F]
                   [--seed N] [--stop-id ID ...] [--bench] [--json FILE]
-                  [--spec] [--spec-k N] [--spec-match N]
+                  [--spec] [--spec-k N] [--spec-mtp-k N] [--no-mtp] [--spec-match N]
 ```
 
 | argument | default | meaning |
@@ -214,9 +225,11 @@ swp-exl3 generate --pipeline FILE [--no-contract]
 | `--stop-id` | — | extra stop token id (repeatable); tokenizer EOS and `<\|user\|>`/`<\|endoftext\|>`/`<\|observation\|>` are always stops |
 | `--bench` | off | print prefill/decode tok/s and per-stage compute vs wire |
 | `--json` | — | write the bench report to a file (with `--bench`) |
-| `--spec` | off | speculative decode with prompt-lookup (n-gram) drafting: one verify forward per round proposes `k` tokens and accepts the matching prefix |
-| `--spec-k` | `3` | drafts per verify round, capped by the stages' `spec_k` |
-| `--spec-match` | `2` | n-gram match length used to look up the draft in the existing history |
+| `--spec` | off | speculative decode: prompt-lookup (n-gram) first, MTP fallback when the lookup misses |
+| `--spec-k` | `3` | n-gram drafts per verify round, capped by the stages' `spec_k` |
+| `--spec-mtp-k` | `2` | MTP drafts per verify round when the n-gram lookup misses (independent of `--spec-k`) |
+| `--no-mtp` | off | exact n-gram drafting only; never ask the head stage for MTP drafts |
+| `--spec-match` | `2` | preferred n-gram match length; a longer value currently falls back to a 2-gram match |
 
 ```bash
 export SWP_SECRET=...
@@ -232,9 +245,9 @@ swp-exl3 generate --pipeline examples/pipeline.toml --prompt "Write a haiku abou
 swp-exl3 generate --pipeline examples/pipeline.toml --prompt-file prompt.txt \
   --max-new 256 --bench --json bench.json
 
-# speculative decode (prompt-lookup drafting; best on repetitive output such as code or lists)
+# speculative decode (n-gram first, MTP fallback; best on repetitive output such as code or lists)
 swp-exl3 generate --pipeline examples/pipeline.toml --prompt "Continue: red green blue red green blue" \
-  --max-new 64 --spec --spec-k 3 --bench
+  --max-new 64 --spec --spec-k 3 --spec-mtp-k 2 --bench
 ```
 
 `--bench` output (per stage: device-synced compute vs wire+queue, and how much of the token the stage
@@ -260,8 +273,12 @@ swp-exl3 smoke --pipeline FILE [--golden FILE] [--update-golden] [--max-kl F]
 Pings both stages, runs the bench prompt once (the first real prefill, printed against a warm repeat
 to show the stage warm-up), runs two fixed greedy prompts for 48 tokens, checks one top-64 logit row
 (top-1 equal and KL ≤ `--max-kl`, default `1e-4`), **compares 20 batched verify rows against
-sequential decode logits** (top-1 equal, KL ≤ 1e-2; skipped when a stage advertises `spec_k = 0`),
-and prints one `--bench` report. Warm run is about 20 s. The golden defaults to
+sequential decode logits** (zero non-near-tie top-1 flips, KL ≤ 1e-2; skipped when a stage advertises
+`spec_k = 0`), and prints one `--bench` report. A top-1 flip is a **near-tie** (and not a failure) only
+when the verify top-1 is in the reference top-k and the reference top-1 is at most 0.1 logits above it;
+that is the engines' batched-kernel floor. Near-ties are capped at 10% of rows (at least one), so a
+systematic flip pattern still fails. The count and budget are printed, and the S2 gross failure (KL 2.25)
+still fails. Warm run is about 20 s. The golden defaults to
 `<pipeline>.golden.json`; create it once on a known-good build with `--update-golden`, then every
 change must pass the same check. Exits non-zero on mismatch.
 
@@ -279,15 +296,22 @@ checkout (the Strix):
 
 ```bash
 python swp_kyojin_server.py --pipeline pipeline.toml --model-dir /models/GLM-5.3-Flash-exl3 \
-  --kyojin-root ~/engines/kyojin --ctx 8192 --host 127.0.0.1 --port 8000 [--spec]
+  --kyojin-root ~/engines/kyojin --ctx 8192 --host 127.0.0.1 --port 8000 \
+  [--spec] [--spec-k 3] [--spec-mtp-k 2] [--no-mtp] [--spec-log FILE]
 ```
 
 `--ctx` is the smallest stage `cache_tokens`. The server keeps history and reuses the longest common prefix, including
 exact token ids of the previous reply, so appended turns prefill only the new text; a trimmed/edited reply triggers the
 normal clear+replay and is reported as `replayed_tokens` (with `cached_tokens = 0`). Each request prints a terminal
 line with the cache verdict (`HIT n/m` / `MISS` / `MISS (replayed n)`), prefill tokens and tok/s (new and effective),
-decode tokens and tok/s, and — when drafting — the speculative acceptance (`spec 48/48 (100.0%, 16 rounds)`).
-`--spec` enables the n-gram speculative path (neutral on novel text, ~1.7x on repetitive). Tool calls work non-stream
+decode tokens and tok/s, and — when drafting — the source mix (`spec n-gram 12r 44/44 | mtp 4r 9/12 | plain 1`).
+`--spec` enables the n-gram speculative path first and the head stage's MTP drafter as the fallback on novel
+text (`--spec-k` is the n-gram window, `--spec-mtp-k` the independent MTP window; `--no-mtp` keeps exact n-gram
+only). n-gram output was byte-identical on the repetitive runs; novel prose can differ on a
+batched-verify near-tie, and MTP output is not guaranteed to be. `--spec-log FILE`
+appends one JSON object per request (`last_stats` + `timestamp` + `request` id) for the agent-trace mix,
+rotating at 64 MiB and keeping two backups.
+Tool calls work non-stream
 and streamed (`finish_reason: "tool_calls"`, `role: "tool"` follow-ups); `--ctx` (the smallest stage
 `cache_tokens`) is the context cap, and over-context prompts get a clean HTTP 400. The pair is not limited
 to 8192: 128k tokens were measured, and 576k fp16 / 768k q8 caches load (see §5.1 and `RESULTS.md` T5).
@@ -334,9 +358,10 @@ max_chunk   = 512                # max rows per FORWARD
 wire_dtypes = ["f32", "bf16"]    # accepted wire dtypes
 warmup      = true               # synthetic forwards after load() so the first real prefill is not cold
 spec_k      = 3                  # speculative draft window this stage can roll back (0 disables `spec`)
-mtp         = false              # head stage only: load the MTP drafter + embedding copy (see §6)
+mtp         = false              # head stage only: load the MTP drafter + embedding copy (see §6);
+                                 # examples/stage-strix.toml ships mtp = true for the n-gram fallback
 # mtp_model_dir = "..."          # pack holding the MTP/embed tensors (default: model_dir)
-# mtp_cache_tokens = 8192        # drafter cache (default: cache_tokens)
+# mtp_cache_tokens = 8192        # drafter cache (default: cache_tokens); must be >= cache_tokens
 # recurrent_dtype = "half"       # ignored where the engine's Cache lacks it (warned)
 # max_history = 0                # extra attention history; auto-raised to spec_k for verify windows
 
@@ -393,6 +418,7 @@ loads such a stage, so it costs the same load time as a standalone stage.
 | `SWP_SECRET` (name set by `secret_env`) | every machine | shared secret for the keyed-hash challenge |
 | `SWP_WEIGHTD` | test host | path to the Rust `swp-weightd`, enables the provisioning test |
 | `SWP_DEBUG_TIMING=1` | stage | log per-forward `prepare/prefetch/forward_ls/flush/advance` ms |
+| `SWP_VERIFY_FASTPATH=0` | Kyojin stage | do not set `dflash_verify` on verify forwards (default on: enables Kyojin's R-row verify kernels; upstream exllamav3 ignores it) |
 | `ROCPROFILER_REGISTER_ENABLED=0` | ROCm stage | set automatically by the adapter (before torch) to stop a core spinning |
 | `PYTHONPATH` | Kyojin stages | point at the Kyojin checkout (it is usually not pip-installed) |
 | `EXL3_MTP_EH_FP16` | MTP head stage | optional unquantized `eh_proj` sidecar (`0` disables); read by `load_eh_proj_sidecar` |
@@ -502,21 +528,39 @@ Hybrid KDA linear attention (recurrent state) + MLA/DSA, MoE, **mHC hyper-connec
 * Single device per stage (`device = "cuda:0"`); autosplit loading is rejected (its dummy pass assumes
   token ids as input). CPU expert offload is likewise layer-split-only.
 * **Prompt-lookup (n-gram) speculative decoding is implemented** (SWP capability `spec`): the coordinator
-  proposes the next `k` tokens from an earlier occurrence of the last 2–3 tokens, one verify forward
+  proposes the next `k` tokens from an earlier occurrence of the last `--spec-match` tokens (default 2),
+  one verify forward
   checks `k+1` rows on both stages, and rejected rows are rewound lazily on the next round (or by
   clear+replay when a stage cannot). Sampling (`temperature > 0`) uses "sample target, accept on equality" in
-  the head stage. Batched verify logits are not bit-identical to 1-row decode on this engine (measured:
-  1-row verify exact, 2-row KL 3e-5, 3/4-row up to 5e-3; top-1 equal throughout, and a plain batched
-  prefill shows the same delta — it is the engine's batched GDN/attention kernels, not SWP). No prefill
+  the head stage. Verify forwards set Kyojin's `dflash_verify` marker, which enables its exact R-row kernels
+  (dense fusions, router/MoE row paths, MLA row loops): a 3-row verify round is ~86 ms instead of ~139,
+  an 8-row round ~156 instead of ~246 (RESULTS.md, "Verify fast-path marker"). They are still not
+  bit-identical end-to-end on this heterogeneous pair: the upstream 1.6.4 first stage has no such
+  kernels (its boundary hidden differs from 1-row decode by 5e-4 at 2 rows to 3e-3 at 5), and the Kyojin
+  stage keeps a ~1e-4–1e-3 logit floor, so a near-tie can flip top-1. `smoke` therefore fails only on a
+  **non-near-tie** flip (reference top-1 within 0.1 logits), and prints the near-tie count. n-gram output
+  was byte-identical to plain greedy on the repetitive runs; a novel-prose run can still diverge on a
+  batched-verify near-tie, and MTP output is not guaranteed to be. On long novel prose, 2-token matches
+  can be plentiful but weak (40 rounds, 8/120 accepted at 8k), which suppresses MTP; a strict 3/4-gram
+  floor is planned (RESULTS.md, "MTP as the n-gram fallback"). A plain
+  batched prefill shows the same class of delta — it is the engines' batched kernels, not SWP. No prefill
   pipelining across stages; star topology (coordinator relays).
-* **MTP drafting on the head stage is implemented but off by default** (`mtp = true` enables it; needs
-  Kyojin's `Glm5NextMTPModel`). The head loads the MTP block, a read-only embedding copy and a separate
-  drafter cache, exports the target's final-norm hidden state on every forward, and returns the next
-  round's drafts (`drafts` / `drafts_basis`). The coordinator prefers an n-gram match and falls back to
-  MTP on novel text. Measured on Model B (3.09 bpw, 149-token novel prompt): acceptance 76.5 / 58.8 /
-  29.4% at depths 1/2/3, best decode **15.5 tok/s vs 15.05 plain** (~1.03x) — below the plan's 1.15x
-  gate, so the n-gram path remains the default. Capacity: +5.0 GB on the Strix (MTP 3.76 GB + embed
-  1.27 GB); 116.3 GB allocated, 10.1 GB free at cache 8192. Details in `RESULTS.md` (S3).
+* **MTP drafting is the fallback under `--spec`** (head stage only; `mtp = true`; needs Kyojin's
+  `Glm5NextMTPModel`). Each round tries the free n-gram lookup first; on a miss it uses the head's MTP
+  drafts for the next round. The windows are independent: `--spec-k` (n-gram) and `--spec-mtp-k` (MTP,
+  default 2), both capped by the stages' `spec_k`; `--no-mtp` keeps n-gram only. The head loads the MTP
+  block, a read-only embedding copy and a separate drafter cache, exports the target's final-norm hidden
+  state on every forward, and returns the next round's drafts (`drafts` / `drafts_basis`). Measured on
+  Model B (3.09 bpw, 149-token novel prompt) before the verify fast-path marker: acceptance
+  76.5 / 58.8 / 29.4% at depths 1/2/3, best decode 15.5 tok/s vs 15.05 plain (~1.03x). **With
+  `dflash_verify` set** (default), k=2 reaches **21.3 tok/s vs 14.7 plain** (1.44x; k=1 19.5, k=3
+  18.7), so `examples/stage-strix.toml` ships `mtp = true` (the portable `StageConfig` default stays
+  `false`). The template keeps its 64k cache and pairs `mtp_cache_tokens` at 64k; the measured 8k MTP
+  profile sets both `cache_tokens` and `mtp_cache_tokens` to 8192. Capacity: +5.0 GB on the Strix (MTP
+  3.76 GB + embed 1.27 GB); 117.6 GB allocated, 8.85 GB free at cache 8192. `mtp_cache_tokens` must be
+  >= `cache_tokens`: the drafter mirrors the target cache and a smaller one overflows on a long prompt.
+  MTP text is not guaranteed byte-identical to plain greedy (see the spec bullet above), which is why
+  `--spec` stays opt-in. Details in `RESULTS.md` (S3 and "Verify fast-path marker").
 * Prefill uses `forward_ls` on every stage (no early-exit `prefill_ls` shortcut), so the last stage
   also runs the head on the final row of each chunk.
 * bf16 wire and `topk` output are implemented; the cut/offload equivalence checks in `MEASUREMENTS.md`

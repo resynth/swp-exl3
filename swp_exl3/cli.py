@@ -49,6 +49,17 @@ SMOKE_BENCH_PROMPT = (
     "the machines matters more for decode than for prefill. Finish with a short summary."
 )
 
+SPEC_MAX_KL = 1e-2                     # batched verify vs 1-row decode: engines' rounding floor, not 1e-3
+SPEC_NEAR_TIE_FRACTION = 0.1           # tolerate at most 10% near-tie flips (at least one)
+
+
+def spec_gate(sc, max_kl=SPEC_MAX_KL):
+    """Gate a `Pipeline.spec_check` result: no non-near-tie top-1 flip, KL within the batched-kernel
+    tolerance, and near-ties bounded to a small fraction of rows. Returns `(ok, near_tie_budget)`."""
+    budget = max(1, int(sc["rows"] * SPEC_NEAR_TIE_FRACTION))
+    ok = (sc["bad_top1"] == 0 and sc["max_kl"] <= max_kl and sc["near_tie_flips"] <= budget)
+    return bool(ok), budget
+
 
 def _pipeline(args):
     from .config import load_pipeline, load_stage
@@ -75,7 +86,8 @@ def _pipeline(args):
 
 def cmd_doctor(a):
     from .doctor import run
-    return run(a.model_dir, tuple(a.layers) if a.layers else None, a.first, a.last)
+    return run(a.model_dir, tuple(a.layers) if a.layers else None, a.first, a.last,
+               require_verify_fastpath=a.require_verify_fastpath)
 
 
 def cmd_stage(a):
@@ -192,8 +204,8 @@ def cmd_generate(a):
     stops |= {int(x) for x in (a.stop_id or [])}
     spec = None
     if a.spec:
-        spec = SpecConfig(k=a.spec_k, match=a.spec_match, seed=a.seed,
-                          accept="argmax" if a.temperature <= 0 else "sample")
+        spec = SpecConfig(k=a.spec_k, match=a.spec_match, mtp_k=a.spec_mtp_k, use_mtp=not a.no_mtp,
+                          seed=a.seed, accept="argmax" if a.temperature <= 0 else "sample")
         if p.spec_k <= 0:
             print("[spec] a stage advertises spec_k=0; running plain decode", file=sys.stderr)
     print(f"[prompt: {len(ids)} tokens]", file=sys.stderr)
@@ -206,7 +218,21 @@ def cmd_generate(a):
         if st.get("spec_rounds") is not None:
             n, d = st["spec_rounds"], max(st["spec_drafted"], 1)
             print(f"spec: {n} rounds, {st['spec_accepted']}/{st['spec_drafted']} drafts accepted "
-                  f"({100.0 * st['spec_accepted'] / d:.1f}%), k={min(a.spec_k, p.spec_k)}", file=sys.stderr)
+                  f"({100.0 * st['spec_accepted'] / d:.1f}%), k={min(a.spec_k, p.spec_k)}, "
+                  f"mtp_k={min(a.spec_mtp_k, p.spec_k) if not a.no_mtp else 0}", file=sys.stderr)
+            mix = []
+            if st.get("spec_ngram_rounds"):
+                mix.append(f"n-gram {st['spec_ngram_rounds']}r "
+                           f"{st['spec_ngram_accepted']}/{st['spec_ngram_drafted']}")
+            if st.get("spec_mtp_rounds"):
+                mix.append(f"mtp {st['spec_mtp_rounds']}r {st['spec_mtp_accepted']}/{st['spec_mtp_drafted']}")
+            if st.get("spec_plain_rounds"):
+                mix.append(f"plain {st['spec_plain_rounds']}")
+            if mix:
+                print("spec mix: " + " | ".join(mix), file=sys.stderr)
+            if st.get("spec_lookup_hits"):
+                print(f"spec lookup: {st['spec_lookup_hits']} hits, "
+                      f"{st['spec_lookup_len_total']} tokens proposed", file=sys.stderr)
             if st.get("spec_mtp_drafts"):
                 print(f"spec timing: verify {st.get('spec_verify_ms', 0):.1f} ms, catch-up "
                       f"{st.get('spec_catchup_ms', 0):.1f} ms, mtp roll {st.get('spec_roll_ms', 0):.1f} ms; "
@@ -286,19 +312,24 @@ def cmd_smoke(a):
                      "ids": ti.tolist(), "logits": tv.tolist()}
 
     # Speculative verify must reproduce sequential-decode logits row for row (batched attention/recurrent state).
-    # Top-1 equality is the functional gate. The KL tolerance is 1e-2, not 1e-3: the engine's batched GDN/attention
-    # kernels round differently from 1-row decode (measured: 1-row verify bit-identical, 2-row KL 3e-5, 3/4-row
-    # KL up to 5e-3; a plain 4-row prefill shows the same difference, so it is batching, not this code).
-    SPEC_MAX_KL = 1e-2
+    # The functional gate is zero non-near-tie top-1 flips, with near-ties bounded to a small fraction of rows
+    # (a systematic flip pattern is a regression even if each flip is close). A mismatch where the reference
+    # top-1 is within 0.1 logits of the verify top-1 is the engines' batched-kernel floor (measured at 2..5
+    # rows); the KL tolerance stays 1e-2, so the S2 gross failure (KL 2.25) still fails. A plain batched
+    # prefill shows the same class of delta.
     spec_ok = True
     if p.spec_k > 0:
         sc = p.spec_check(lid, rows=20, k=min(3, p.spec_k), klog=8)
-        spec_ok = sc["top1"] and sc["max_kl"] <= SPEC_MAX_KL
+        spec_ok, near_tie_budget = spec_gate(sc)
         print(f"spec     {'ok' if spec_ok else 'FAIL'}  {sc['rows']} verify rows vs sequential  "
-              f"top-1 mismatches: {sc['bad_top1']}  max KL: {sc['max_kl']:.2e}  (k={sc['k']})", file=sys.stderr)
+              f"top-1 mismatches: {sc['bad_top1']} ({sc['near_tie_flips']} near-tie, "
+              f"budget {near_tie_budget})  max KL: {sc['max_kl']:.2e}  (k={sc['k']})", file=sys.stderr)
     else:
+        near_tie_budget = 0
         print("[spec] stages advertise spec_k=0; verify-vs-sequential check skipped", file=sys.stderr)
-    rec["spec"] = {"rows": 20, "ok": spec_ok}
+    rec["spec"] = {"rows": 20, "ok": spec_ok, "bad_top1": sc["bad_top1"] if p.spec_k > 0 else 0,
+                   "near_tie_flips": sc["near_tie_flips"] if p.spec_k > 0 else 0,
+                   "near_tie_budget": near_tie_budget}
 
     g, st = _smoke_generate(p, tok, SMOKE_BENCH_PROMPT, 48, pc.topk)
     print(f"[bench prompt] {len(g['prompt_ids'])} tokens", file=sys.stderr)
@@ -349,6 +380,8 @@ def main(argv=None):
 
     s = sp.add_parser("doctor", help="verify engine APIs on this machine; optional dry-run slice")
     s.add_argument("--model-dir"); s.add_argument("--layers", nargs=2, type=int); s.add_argument("--first", action="store_true"); s.add_argument("--last", action="store_true")
+    s.add_argument("--require-verify-fastpath", action="store_true",
+                   help="fail (not warn) when the dflash_verify marker is absent, even on an upstream-like engine")
     s.set_defaults(fn=cmd_doctor)
 
     s = sp.add_parser("stage", help="load a slice and serve it"); s.add_argument("--config", required=True); s.set_defaults(fn=cmd_stage)
@@ -367,9 +400,11 @@ def main(argv=None):
     s.add_argument("--prompt"); s.add_argument("--prompt-file"); s.add_argument("--ids"); s.add_argument("--ids-file", help="file of comma/space-separated token ids (long prompts)"); s.add_argument("--chat", action="store_true"); s.add_argument("--system")
     s.add_argument("--max-new", type=int, default=128); s.add_argument("--temperature", type=float, default=0.0); s.add_argument("--top-p", type=float, default=1.0)
     s.add_argument("--seed", type=int); s.add_argument("--stop-id", action="append"); s.add_argument("--bench", action="store_true"); s.add_argument("--json")
-    s.add_argument("--spec", action="store_true", help="speculative decode with prompt-lookup (n-gram) drafting")
-    s.add_argument("--spec-k", type=int, default=3, help="drafts per verify round (capped by the stages' spec_k)")
-    s.add_argument("--spec-match", type=int, default=2, help="n-gram match length for prompt-lookup drafting")
+    s.add_argument("--spec", action="store_true", help="speculative decode: prompt-lookup (n-gram) first, MTP fallback")
+    s.add_argument("--spec-k", type=int, default=3, help="n-gram drafts per verify round (capped by the stages' spec_k)")
+    s.add_argument("--spec-mtp-k", type=int, default=2, help="MTP drafts per verify round when the n-gram lookup misses")
+    s.add_argument("--no-mtp", action="store_true", help="exact n-gram drafting only; never ask the head stage for MTP drafts")
+    s.add_argument("--spec-match", type=int, default=2, help="preferred n-gram match length (a longer value falls back to 2)")
     s.set_defaults(fn=cmd_generate)
 
     s = sp.add_parser("smoke", help="<90 s correctness gate: ping, two greedy prompts, top-k logits, one bench"); pl(s)

@@ -179,7 +179,10 @@ class StageServer:
             return_rows = h.get("return_rows", "last")
         draft = None
         if h.get("next_drafts") and swp.CAP_MTP in self.caps:
-            nk = len(spec["draft_ids"]) if spec is not None else int(h.get("draft_k") or 0)
+            # A verify round must propose the MTP window (draft_k), not the number of n-gram drafts it
+            # happened to carry: the two windows are independent.
+            default_k = len(spec["draft_ids"]) if spec is not None else 0
+            nk = int(h.get("draft_k") or default_k)
             draft = {"next_drafts": True, "k": nk, "sampling": h.get("sampling")}
         t_pre = time.perf_counter()
         try:

@@ -25,6 +25,23 @@ class T(unittest.TestCase):
         with self.assertRaises(config.ConfigError):
             self._load("cache_bits = 4\n")
 
+    def test_mtp_cache_must_cover_target_cache(self):
+        with self.assertRaises(config.ConfigError):
+            self._load("head = true\nmtp = true\nmtp_cache_tokens = 4096\n")
+
+    def test_mtp_cache_equal_to_target_cache_is_valid(self):
+        c = self._load("head = true\nmtp = true\nmtp_cache_tokens = 8192\n")
+        self.assertEqual(c.mtp_cache_tokens, 8192)
+
+    def test_mtp_cache_is_ignored_when_mtp_is_off(self):
+        c = self._load("mtp_cache_tokens = 4096\n")
+        self.assertEqual(c.mtp_cache_tokens, 4096)
+        self.assertFalse(c.mtp)
+
+    def test_mtp_requires_head(self):
+        with self.assertRaises(config.ConfigError):
+            self._load("mtp = true\n")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

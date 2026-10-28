@@ -17,14 +17,17 @@ embed = false
 head = true                          # the last stage also holds hc_head, final norm and lm_head
 device = "cuda:0"
 cache_tokens = 65536                 # machine-local: KV/state cache, multiple of 256; size to this host's free memory
+                                     # (the measured 8k MTP profile sets this AND mtp_cache_tokens to 8192)
 max_chunk = 2048                     # rows per FORWARD (boundary row = hc_mult*hidden*4 bytes = 64 KiB at f32 for GLM-5.3)
 wire_dtypes = ["f32", "bf16"]
 cache_bits = 0                       # 0 = fp16 KV cache; 8 = packed int8 KV (CacheLayer_quant, longer context)
 
 spec_k = 8                           # speculative draft window (verify rollback); 0 disables.
                                      # 8 enables the n-gram k=8 window (2.14x plain on repetitive text, RESULTS.md)
-# mtp = true                         # head stage only: MTP drafter + read-only embedding copy (S3: no win here)
-# mtp_cache_tokens = 8192
+mtp = true                           # head stage only: MTP drafter + read-only embedding copy. n-gram is tried
+                                     # first; MTP is the fallback on novel text (k=2: 1.44x, +5.0 GB at 8k).
+mtp_cache_tokens = 65536             # drafter cache; MUST be >= cache_tokens. The measured 8k MTP profile sets
+                                     # cache_tokens = mtp_cache_tokens = 8192 (keep the two paired).
 
 # Kyojin 1.5.0 `tools/glm/serve.py` SPEED_ENV. Regenerate with:
 #   swp-exl3 speed-env --kyojin-root /path/to/kyojin

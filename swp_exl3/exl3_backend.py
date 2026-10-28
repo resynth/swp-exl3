@@ -93,6 +93,9 @@ class Exl3Backend(Backend):
         self.cache_tokens = cfg.cache_tokens
         self.spec_k = int(getattr(cfg, "spec_k", 0) or 0)
         self.supports_spec = self.spec_k > 0
+        # Mark verify forwards for the engine's R-row fast paths (see _forward_impl). SWP_VERIFY_FASTPATH=0
+        # restores the pre-marker calls for an A/B on the same engine build.
+        self.verify_fastpath = os.environ.get("SWP_VERIFY_FASTPATH", "1") != "0"
         self.cache_bits_requested = int(getattr(cfg, "cache_bits", 0) or 0)
         if self.cache_bits_requested not in (0, 8):
             raise ValueError(f"cache_bits must be 0 (fp16 KV) or 8 (packed int8 KV), got {self.cache_bits_requested!r}")
@@ -146,6 +149,9 @@ class Exl3Backend(Backend):
         self.mtp_config = mtp_cfg
         self.mtp_model = Model.from_config(mtp_cfg, component="mtp")
         ct = int(self.cfg.mtp_cache_tokens or self.cfg.cache_tokens)
+        if ct < int(self.cfg.cache_tokens):
+            raise ValueError(f"mtp_cache_tokens must be >= cache_tokens ({ct} < {self.cfg.cache_tokens}); "
+                             f"the drafter mirrors the target cache and overflows on a long prompt")
         if ct % 256 or ct < 256:
             raise ValueError("mtp_cache_tokens must be a positive multiple of 256 (page size)")
         mtp_kwargs = dict(max_num_tokens=ct, max_batch_size=1, max_history=0)
@@ -230,7 +236,16 @@ class Exl3Backend(Backend):
         return {"attn_mode": "flash_attn", "cache": self.mtp_cache, "past_len": int(pos),
                 "batch_shape": (1, int(self.mtp_cache.max_num_tokens)), "target_hidden": hidden}
 
+    def _mtp_room(self, pos, rows):
+        """The drafter cache mirrors the target cache; fail with a clear error instead of an engine fault."""
+        cap = int(getattr(self.mtp_cache, "max_num_tokens", 0) or 0)
+        need = int(pos) + int(rows)
+        if cap and need > cap:
+            raise RuntimeError(f"MTP drafter cache needs {need} tokens, mtp_cache_tokens={cap}; "
+                               f"raise mtp_cache_tokens or shorten the prompt/generation")
+
     def _mtp_prefill(self, token_ids, hidden, pos):
+        self._mtp_room(pos, len(token_ids))
         ids = self.torch.tensor([list(token_ids)], dtype=self.torch.long, device=hidden.device)
         self.mtp_model.prefill(ids, self._mtp_params(pos, hidden))
 
@@ -238,6 +253,7 @@ class Exl3Backend(Backend):
         """Autoregressively propose k drafts. `carry` is the target hidden of the previous position;
         the first step writes the drafter row for `first_token` and predicts the token after it."""
         t = self.torch
+        self._mtp_room(pos, int(k))
         ids = t.tensor([[int(first_token)]], dtype=t.long, device=carry.device)
         out, h = [], carry
         for j in range(int(k)):
@@ -417,6 +433,12 @@ class Exl3Backend(Backend):
             # Record one row of recurrent history per draft. advance_recurrent_states sets
             # last_history = n - 1, which is what a later GDNState.rewind(num_rejected) expects.
             params["recurrent_history"] = True
+            # Kyojin's exact R-row verify paths are gated on this marker (its generator sets it on every
+            # verify forward): fused dense linears, the MoE union/router row paths, the MLA/GDN projection
+            # row loops and the R-row block graphs. Without it a 2..8-row verify silently falls back to the
+            # generic multi-row route. Upstream exllamav3 does not read the key, so it is inert there.
+            if self.verify_fastpath:
+                params["dflash_verify"] = True
         if self.has_head:
             params["last_tokens_only"] = n if (want not in ("none", "hidden") and return_rows == "all") else 1
             if self.mtp_enabled:

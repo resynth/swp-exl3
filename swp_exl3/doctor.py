@@ -1,11 +1,37 @@
 """`swp-exl3 doctor`: verify, on THIS machine's installed exllamav3, every engine API the adapter relies on, and
 optionally dry-run the slice (build the model structure, no weights) for a layer range."""
-import importlib, importlib.util, inspect, sys
+import importlib, importlib.util, inspect, os, sys
 
 OK, WARN, FAIL = "ok  ", "WARN", "FAIL"
 
 
-def run(model_dir=None, layers=None, first=False, last=False, out=print):
+def find_engine_marker(root, needle):
+    """Files under `root` that contain `needle`: the literal in `.py` sources, or as a byte string in a
+    compiled `.so`/`.pyd` fallback (an extension build can carry the marker without the source)."""
+    def walk(exts, binary):
+        hits = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d not in ("__pycache__", ".git"))
+            for fn in sorted(filenames):
+                if not fn.endswith(exts):
+                    continue
+                p = os.path.join(dirpath, fn)
+                try:
+                    if binary:
+                        with open(p, "rb") as f:
+                            if needle.encode() in f.read():
+                                hits.append(p)
+                    else:
+                        with open(p, encoding="utf-8", errors="ignore") as f:
+                            if needle in f.read():
+                                hits.append(p)
+                except OSError:
+                    continue
+        return hits
+    return walk(".py", False) or walk((".so", ".pyd"), True)
+
+
+def run(model_dir=None, layers=None, first=False, last=False, out=print, require_verify_fastpath=False):
     res = []
 
     def check(name, fn):
@@ -31,6 +57,48 @@ def run(model_dir=None, layers=None, first=False, last=False, out=print):
     ex = importlib.import_module("exllamav3")
     ver = getattr(importlib.import_module("exllamav3.version"), "__version__", "?")
     out(f"exllamav3 {ver} from {ex.__file__}")
+
+    # Kyojin gates its exact R-row verify kernels on this marker; without it a 2..8-row verify silently
+    # takes the generic multi-row route (a slowdown, not a crash). Upstream has no marker and no such path.
+    def verify_fastpath():
+        name = "verify fast path (dflash_verify)"
+        engine_root = os.path.dirname(os.path.abspath(ex.__file__))
+        hits = find_engine_marker(engine_root, "dflash_verify")
+        disabled = os.environ.get("SWP_VERIFY_FASTPATH", "1") == "0"
+        kyojin = importlib.util.find_spec("exllamav3.modules.block_graph") is not None
+        if hits:
+            if disabled:
+                warn(name, f"marker present in {len(hits)} file(s) but SWP_VERIFY_FASTPATH=0")
+            else:
+                rel = ", ".join(os.path.relpath(h, engine_root) for h in hits[:3])
+                more = "" if len(hits) <= 3 else f" (+{len(hits) - 3})"
+                check(name, lambda: f"marker in {len(hits)} file(s): {rel}{more}")
+            return
+        msg = ("marker missing on a Kyojin-like engine: verify forwards silently use the generic "
+               "multi-row path") if kyojin else "generic multi-row path (expected on upstream exllamav3)"
+        if kyojin or require_verify_fastpath:
+            res.append((FAIL, name, msg))
+            out(f"[{FAIL}] {name}  {msg}")
+        else:
+            warn(name, msg)
+    verify_fastpath()
+
+    def mtp_api():
+        name = "MTP drafter API"
+        try:
+            from exllamav3.architecture.glm5_next import Glm5NextMTPModel
+        except Exception as e:                                          # noqa: BLE001 - capability probe
+            warn(name, f"MTP unavailable ({type(e).__name__}: {e}); keep mtp=false")
+            return
+        missing = [m for m in ("attach_to", "sample_from_state") if not hasattr(Glm5NextMTPModel, m)]
+        if missing:
+            warn(name, f"Glm5NextMTPModel lacks {missing}; keep mtp=false")
+            return
+        check(name, lambda: "Glm5NextMTPModel.attach_to + sample_from_state")
+        sidecar = os.environ.get("EXL3_MTP_EH_FP16")
+        if sidecar and sidecar != "0" and os.path.isfile(sidecar):
+            out(f"       eh_proj sidecar: {sidecar}")
+    mtp_api()
 
     from exllamav3 import Config, Model, Cache
     check("Config.from_directory + infer_params", lambda: hasattr(Config, "from_directory"))
