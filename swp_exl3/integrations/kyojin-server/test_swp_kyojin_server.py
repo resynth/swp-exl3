@@ -1,7 +1,7 @@
 """Tests for swp_kyojin_server against Kyojin's REAL HTTP layer (tools/glm/serve.py) and a fake pipeline (no GPU).
 Set KYOJIN_ROOT (checkout) and SWP_EXL3_ROOT (the swp-exl3 repo) if they are not at the defaults below.
 torch is stubbed only if it is not installed (Kyojin's helper modules import it at the top)."""
-import asyncio, json, os, sys, threading, unittest
+import asyncio, json, os, sys, tempfile, threading, unittest
 from unittest import mock
 
 KYOJIN = os.path.expanduser(os.environ.get("KYOJIN_ROOT", "~/engines/kyojin"))
@@ -17,7 +17,7 @@ import serve as kserve                                   # noqa: E402  Kyojin's 
 import swp_kyojin_server as sks                          # noqa: E402
 from aiohttp.test_utils import TestClient, TestServer    # noqa: E402
 from swp_exl3.backend import FakeBackend                 # noqa: E402
-from swp_exl3.coordinator import Pipeline                # noqa: E402
+from swp_exl3.coordinator import Pipeline, SpecConfig    # noqa: E402
 from swp_exl3.server import StageServer                  # noqa: E402
 
 ALPHA = "abcdefghijklmnopqrstuvwxyz0123456789 \n:.,!?-_'\"()/;<>|[]=+*&%#@^~"[:63] + "\u0001"   # 64 symbols; id 63 = eos
@@ -174,6 +174,70 @@ class T(unittest.TestCase):
         line = sks.request_line(4, "HIT 10/12", 2, 12, 0.1, 8, 8, 0.5, accepted=6, rejected=6, rounds=3)
         self.assertIn("spec 6/12 (50.0%, 3 rounds)", line)
         self.assertNotIn("spec", sks.request_line(1, "MISS", 10, 10, 0.2, 5, 5, 0.4))
+
+    def test_request_line_reports_source_mix(self):
+        st = {"spec_ngram_rounds": 12, "spec_ngram_accepted": 44, "spec_ngram_drafted": 44,
+              "spec_mtp_rounds": 4, "spec_mtp_accepted": 9, "spec_mtp_drafted": 12,
+              "spec_plain_rounds": 1}
+        line = sks.request_line(4, "HIT 10/12", 2, 12, 0.1, 8, 8, 0.5, mix=st)
+        self.assertIn("spec n-gram 12r 44/44 | mtp 4r 9/12 | plain 1", line)
+
+    def test_spec_log_writes_jsonl(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "spec.jsonl")
+        self.engine.spec_log = path
+        self.engine.spec = SpecConfig(k=3, match=4, mtp_k=2)
+        async def go():
+            async with TestClient(TestServer(self.app)) as c:
+                r = await self.post(c, [{"role": "user", "content": "hi"}], ignore_eos=True, max_tokens=4)
+                self.assertEqual(r.status, 200)
+        run(go())
+        with open(path, encoding="utf-8") as f:
+            lines = [json.loads(x) for x in f if x.strip()]
+        self.assertEqual(len(lines), 1)
+        rec = lines[0]
+        self.assertEqual(rec["request"], 1)
+        self.assertIn("timestamp", rec)
+        self.assertIn("prompt_tokens", rec)
+        self.assertIn("spec_ngram_rounds", rec)
+        self.assertEqual(rec["spec_match"], 4)
+
+    def test_spec_log_rotates(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "spec.jsonl")
+        self.engine.spec_log = path
+        old_max = sks.SPEC_LOG_MAX_BYTES
+        sks.SPEC_LOG_MAX_BYTES = 1
+        try:
+            self.engine._append_spec_log({"request": 1})
+            self.engine._append_spec_log({"request": 2})
+        finally:
+            sks.SPEC_LOG_MAX_BYTES = old_max
+        self.assertTrue(os.path.exists(path))
+        self.assertTrue(os.path.exists(path + ".1"))
+        with open(path + ".1", encoding="utf-8") as f:
+            self.assertEqual(json.loads(f.readline())["request"], 1)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.loads(f.readline())["request"], 2)
+
+    def test_cli_parses_spec_mtp_flags(self):
+        a = sks.build_parser().parse_args(
+            ["--pipeline", "p.toml", "--model-dir", "m", "--spec", "--spec-mtp-k", "4", "--no-mtp",
+             "--spec-log", "s.jsonl"])
+        self.assertEqual(a.spec_mtp_k, 4)
+        self.assertTrue(a.no_mtp)
+        self.assertEqual(a.spec_log, "s.jsonl")
+
+    def test_spec_match_parser_default_and_override(self):
+        a = sks.build_parser().parse_args(["--pipeline", "p.toml", "--model-dir", "m"])
+        self.assertEqual(a.spec_match, 4)
+        a = sks.build_parser().parse_args(["--pipeline", "p.toml", "--model-dir", "m", "--spec-match", "5"])
+        self.assertEqual(a.spec_match, 5)
+
+    def test_num_draft_is_the_larger_window(self):
+        e = sks.PipelineEngine(self.pipe, self.tok, ctx=4096, eos_ids=[63], seq_factory=lambda ids: list(ids),
+                               log=lambda *a: None, spec=SpecConfig(k=3, mtp_k=5))
+        self.assertEqual(e.num_draft, 5)
 
     def test_ids_for_splices_exact_ids_and_falls_back(self):
         e = self.engine

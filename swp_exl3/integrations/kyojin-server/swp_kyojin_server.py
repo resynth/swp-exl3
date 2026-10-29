@@ -21,6 +21,7 @@ no images; no min_p / penalties / logit_bias / grammar (a warning is logged once
 """
 import argparse
 import asyncio
+import json
 import os
 import sys
 import threading
@@ -30,6 +31,10 @@ from pathlib import Path
 
 class _Cancelled(Exception):
     pass
+
+
+SPEC_LOG_MAX_BYTES = 64 * 1024 * 1024      # rotate --spec-log at 64 MiB
+SPEC_LOG_BACKUPS = 2                       # keep .1 and .2
 
 
 def common_prefix_len(a, b):
@@ -94,12 +99,29 @@ class _Detok:
         return now[len(before):] if len(now) > len(before) else ""
 
 
-def request_line(n, cache, pre_n, total, pre_s, out_n, gen_n, dec_s, accepted=0, rejected=0, rounds=0):
-    """One terminal line per request: cache verdict, prefill/decode rates, and (when drafting) acceptance."""
+def _spec_mix(st):
+    """Compact source mix: `n-gram 12r 44/44 | mtp 4r 9/12 | plain 1`."""
+    parts = []
+    if int(st.get("spec_ngram_rounds") or 0):
+        parts.append(f"n-gram {int(st['spec_ngram_rounds'])}r "
+                     f"{int(st.get('spec_ngram_accepted') or 0)}/{int(st.get('spec_ngram_drafted') or 0)}")
+    if int(st.get("spec_mtp_rounds") or 0):
+        parts.append(f"mtp {int(st['spec_mtp_rounds'])}r "
+                     f"{int(st.get('spec_mtp_accepted') or 0)}/{int(st.get('spec_mtp_drafted') or 0)}")
+    if int(st.get("spec_plain_rounds") or 0):
+        parts.append(f"plain {int(st['spec_plain_rounds'])}")
+    return " | ".join(parts)
+
+
+def request_line(n, cache, pre_n, total, pre_s, out_n, gen_n, dec_s, accepted=0, rejected=0, rounds=0, mix=None):
+    """One terminal line per request: cache verdict, prefill/decode rates, and (when drafting) the source mix."""
     eff_tps, new_tps = total / pre_s, pre_n / pre_s
     dec_n = max(gen_n - 1, 1)
     spec = ""
-    if accepted + rejected:
+    mix_line = _spec_mix(mix or {})
+    if mix_line:
+        spec = f" | spec {mix_line}"
+    elif accepted + rejected:
         pct = 100.0 * accepted / (accepted + rejected)
         spec = f" | spec {accepted}/{accepted + rejected} ({pct:.1f}%" + (f", {rounds} rounds)" if rounds else ")")
     return (f"[req {n}] {cache} | prefill {pre_n} new + {total - pre_n} cached in {pre_s * 1e3:.0f} ms "
@@ -114,12 +136,14 @@ class PipelineEngine:
     sessions = 1
     num_draft = 0
 
-    def __init__(self, pipeline, tokenizer, ctx, eos_ids=(), seq_factory=None, log=print, spec=None):
+    def __init__(self, pipeline, tokenizer, ctx, eos_ids=(), seq_factory=None, log=print, spec=None, spec_log=None):
         self.pipeline, self.tok, self.ctx, self.log = pipeline, tokenizer, int(ctx), log
         self.eos_ids = {int(e) for e in eos_ids}
         self._seq = seq_factory or _default_seq
-        self.spec = spec               # coordinator.SpecConfig (n-gram drafting); None = plain decode
-        self.num_draft = int(getattr(spec, "k", 0) or 0) if spec is not None else 0
+        self.spec = spec               # coordinator.SpecConfig (n-gram + MTP fallback); None = plain decode
+        self.num_draft = max(int(getattr(spec, "k", 0) or 0), int(getattr(spec, "mtp_k", 0) or 0)) \
+            if spec is not None else 0
+        self.spec_log = spec_log       # optional JSONL path: one object per request
         self.last_stats = {}
         self._prev_ids = None           # exact ids of the previous prompt + reply (including the last sampled token)
         self._warned = set()
@@ -183,6 +207,21 @@ class PipelineEngine:
             self._warned.add(key)
             self.log(f"[swp-kyojin-server] {msg}")
 
+    def _append_spec_log(self, rec):
+        """Append one JSONL record, rotating at SPEC_LOG_MAX_BYTES (keeps .1/.2 backups)."""
+        path = self.spec_log
+        try:
+            if os.path.exists(path) and os.path.getsize(path) >= SPEC_LOG_MAX_BYTES:
+                for i in range(SPEC_LOG_BACKUPS - 1, 0, -1):
+                    src = f"{path}.{i}"
+                    if os.path.exists(src):
+                        os.replace(src, f"{path}.{i + 1}")
+                os.replace(path, f"{path}.1")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        except OSError as e:
+            self._warn_once("spec_log", f"cannot write --spec-log {path}: {e}")
+
     # ---------------------------------------------------------------- generation
     async def generate(self, prompt, *, max_tokens, temperature, top_p, stop, sampler_kw=None, cancel=None,
                        images=None, stats=None, img_stats=None, prompt_ids=None, ignore_eos=False,
@@ -221,7 +260,9 @@ class PipelineEngine:
         marks, st_box = {}, {}
         spec = self.spec
         if spec is not None:
-            spec = type(spec)(k=spec.k, match=spec.match, accept=spec.accept, drafter=spec.drafter, seed=seed)
+            spec = type(spec)(k=spec.k, match=spec.match, mtp_k=getattr(spec, "mtp_k", 2),
+                              use_mtp=getattr(spec, "use_mtp", True),
+                              accept=spec.accept, drafter=spec.drafter, seed=seed)
 
         def on_token(t):
             if stop_flag.is_set() or (cancel is not None and cancel.is_set()):
@@ -281,8 +322,18 @@ class PipelineEngine:
                                "rollback": st.get("rollback"),
                                "reused_prefix": reused, "new_tokens": len(gen_ids),
                                "time_prefill": first - t0, "time_generate": max(end - first, 0.0),
-                               "accepted_draft_tokens": accepted, "rejected_draft_tokens": rejected}
+                               "accepted_draft_tokens": accepted, "rejected_draft_tokens": rejected,
+                               "spec_match": int(getattr(self.spec, "match", 0) or 0)}
+            for key in ("spec_rounds", "spec_drafted", "spec_accepted", "spec_mtp_drafts",
+                        "spec_ngram_rounds", "spec_ngram_drafted", "spec_ngram_accepted",
+                        "spec_mtp_rounds", "spec_mtp_drafted", "spec_mtp_accepted",
+                        "spec_plain_rounds", "spec_lookup_hits", "spec_lookup_len_total"):
+                self.last_stats[key] = int(st.get(key) or 0)
+            for key in ("spec_ngram_verify_ms", "spec_mtp_verify_ms", "spec_mtp_roll_ms"):
+                self.last_stats[key] = round(float(st.get(key) or 0.0), 3)
             self._requests += 1
+            if self.spec_log:
+                self._append_spec_log({"timestamp": time.time(), "request": self._requests, **self.last_stats})
             out_n = sum(1 for t in gen_ids if t not in eos)
             pre_s, dec_s = max(first - t0, 1e-6), max(end - first, 1e-6)
             if replayed:
@@ -292,7 +343,7 @@ class PipelineEngine:
             else:
                 cache, pre_n = "MISS", len(ids)
             self.log(request_line(self._requests, cache, pre_n, len(ids), pre_s, out_n, len(gen_ids), dec_s,
-                                  accepted, rejected, int(st.get("spec_rounds") or 0)))
+                                  accepted, rejected, int(st.get("spec_rounds") or 0), mix=st))
             if stats is not None:
                 stats.update(self.last_stats)
 
@@ -306,7 +357,7 @@ def _default_seq(ids):
 
 
 # -------------------------------------------------------------------------------------------------- CLI
-def main(argv=None):
+def build_parser():
     ap = argparse.ArgumentParser(description="OpenAI-compatible server for a swp-exl3 pipeline, using Kyojin's HTTP layer")
     ap.add_argument("--pipeline", required=True, help="swp-exl3 pipeline.toml")
     ap.add_argument("--model-dir", required=True, help="model directory (tokenizer, config, chat_template.jinja)")
@@ -317,10 +368,19 @@ def main(argv=None):
     ap.add_argument("--ctx", type=int, default=8192, help="context window to advertise: the SMALLEST stage cache_tokens")
     ap.add_argument("--chat-template", default=None, help="jinja file (default: Kyojin's GLM-5.3 template, else <model>/chat_template.jinja)")
     ap.add_argument("--stop-id", action="append", default=[], help="extra stop token id (repeatable)")
-    ap.add_argument("--spec", action="store_true", help="prompt-lookup (n-gram) speculative decoding")
-    ap.add_argument("--spec-k", type=int, default=3, help="drafts per verify round (capped by the stages' spec_k)")
-    ap.add_argument("--spec-match", type=int, default=2, help="n-gram match length for drafting")
-    args = ap.parse_args(argv)
+    ap.add_argument("--spec", action="store_true", help="speculative decoding: prompt-lookup (n-gram) first, MTP fallback")
+    ap.add_argument("--spec-k", type=int, default=3, help="k: drafts per round; the verify window is k+1 rows (measured Kyojin ceiling: 7)")
+    ap.add_argument("--spec-mtp-k", type=int, default=2, help="MTP drafts per verify round when the n-gram lookup misses")
+    ap.add_argument("--no-mtp", action="store_true", help="exact n-gram drafting only; never ask the head stage for MTP drafts")
+    ap.add_argument("--spec-match", type=int, default=4,
+                    help="n: minimum match length, strict. The last N tokens must already occur in the context (no 2-gram fallback)")
+    ap.add_argument("--spec-log", default=None,
+                    help="append one JSON object per request (stats + timestamp + id); rotates at 64 MiB, 2 backups")
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
 
     root = Path(args.kyojin_root).expanduser().resolve()
     sys.path.insert(0, str(root / "tools" / "glm"))
@@ -349,8 +409,10 @@ def main(argv=None):
     tpl = Path(args.chat_template).expanduser() if args.chat_template else Path(kserve.DEFAULT_TEMPLATE)
     if not tpl.exists():
         tpl = Path(args.model_dir) / "chat_template.jinja"
-    spec = SpecConfig(k=max(0, args.spec_k), match=max(1, args.spec_match)) if args.spec else None
-    engine = PipelineEngine(pipe, tok, args.ctx, eos, spec=spec, log=lambda m: print(m, flush=True))
+    spec = SpecConfig(k=max(0, args.spec_k), match=args.spec_match,
+                      mtp_k=max(0, args.spec_mtp_k), use_mtp=not args.no_mtp) if args.spec else None
+    engine = PipelineEngine(pipe, tok, args.ctx, eos, spec=spec, spec_log=args.spec_log,
+                            log=lambda m: print(m, flush=True))
     app = kserve.create_app(engine, args.model_id, tpl.read_text(encoding="utf-8"))
     print(f"swp-kyojin-server: {len(pc.stages)} stages, ctx {args.ctx}, template {tpl}, http://{args.host}:{args.port}", flush=True)
     web.run_app(app, host=args.host, port=args.port)

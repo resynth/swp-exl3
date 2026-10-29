@@ -89,8 +89,12 @@ def load_stage(path):
         engine=dict(t.get("engine", {})), load=dict(t.get("load", {})), env=dict(t.get("env", {})))
     if c.cache_tokens % 256:
         raise ConfigError("cache_tokens must be a multiple of 256")
-    if c.mtp_cache_tokens is not None and c.mtp_cache_tokens % 256:
-        raise ConfigError("mtp_cache_tokens must be a multiple of 256")
+    if c.mtp_cache_tokens is not None:
+        if c.mtp_cache_tokens % 256:
+            raise ConfigError("mtp_cache_tokens must be a multiple of 256")
+        if c.mtp and c.mtp_cache_tokens < c.cache_tokens:
+            raise ConfigError(f"mtp_cache_tokens ({c.mtp_cache_tokens}) must be >= cache_tokens "
+                              f"({c.cache_tokens}); the drafter mirrors the target cache")
     if c.cache_bits not in (0, 8):
         raise ConfigError(f"cache_bits must be 0 (fp16) or 8 (packed int8), got {c.cache_bits!r}")
     if c.mtp and not c.head:

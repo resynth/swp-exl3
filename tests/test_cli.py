@@ -92,6 +92,15 @@ class T(unittest.TestCase):
         finally:
             cli._tokenizer = old
 
+    def test_spec_match_parser_default_and_override(self):
+        a = cli.build_parser().parse_args(["generate", "--pipeline", "p.toml", "--ids", "1,2"])
+        self.assertEqual(a.spec_match, 4)
+        self.assertEqual(a.spec_k, 3)
+        a = cli.build_parser().parse_args(["generate", "--pipeline", "p.toml", "--ids", "1,2",
+                                           "--spec", "--spec-match", "5", "--spec-k", "7"])
+        self.assertEqual(a.spec_match, 5)
+        self.assertEqual(a.spec_k, 7)
+
     def test_config_validation(self):
         d = tempfile.mkdtemp()
         bad = os.path.join(d, "bad.toml")

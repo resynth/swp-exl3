@@ -603,8 +603,12 @@ pair's context cap.
 
 All stage/serve processes are stopped (including the S3 Razer and Strix stages); the Strix is idle,
 the Razer GPU is free. The remote `/home/m/swp/swp-exl3` tree is synced to the current local tree.
-The Strix stage config is left with `mtp = false` (the measured default); enable it with
-`mtp = true` and `mtp_cache_tokens = 8192` to reproduce the S3 rows.
+The Strix stage config at the time of the S3 sweep had `mtp = false`; enable it with
+`mtp = true` and `mtp_cache_tokens = 8192` (>= `cache_tokens`) to reproduce those rows. The current
+repo template (`examples/stage-strix.toml`) ships `mtp = true` for the fallback policy below.
+The live MTP validation used `/home/m/swp/stage-310-strix-k7-mtp-8k.toml` (cache 8192,
+`mtp_cache_tokens = 8192`) on the Strix and `~/models/stage-310-razer-k7.toml` on the Razer; both
+stages are stopped again after the run.
 The persistent `swp-kyojin-server` is stopped too. Its Strix pipeline config is
 `/home/m/swp/pipeline-310-k7-server.toml` (stage 0 `10.10.10.1:7801`, stage 1 `127.0.0.1:7802`); start it with
 `--spec` to reproduce the n-gram server rows in Task 6.
@@ -705,6 +709,10 @@ Prefill 1,576 warm 485.6 tok/s; `smoke` PASS.
   `~/models/stage-310-razer-k7-f16-sk8.toml`.
 
 ## Verify-row flag sweep (2–4 rows) — no cheaper 2-row step, MTP stays gated
+
+> **Superseded for the R≥2 path by "Verify-row flag sweep re-run (marker ON)" below.** This sweep ran
+> before the adapter set `params["dflash_verify"]`, so every flag it tested selected a kernel the
+> forwards never reached. The re-run keeps the T6 numbers only as the marker-off control.
 
 **Question.** The verify curve's expensive step is 1→2 rows (~+45 ms for a 2-row verify over a
 ~67 ms plain token). Can `EXL3_HIP_PREFILL_MIN_ROWS`, `EXL3_DEC_ROUTER_ROWS`, `EXL3_VERIFY_FUSE`, or
@@ -832,12 +840,381 @@ tok/s); **B=32 is the fast path for highly constrained repetitive output** (63.4
 universally bit-identical to sequential decode. B=24 is slower than B=16 and buys no correctness, so
 avoid it.
 
-**MTP is unaffected:** its k=1/3 rounds are B=2/4, far from the long-window regime; the MTP gate in
-the previous section still stands. The long-window upside belongs to n-gram lookups with long exact
-matches (code blocks, quoted lists, repeated paragraphs).
+**MTP is unaffected by the long window:** its k=1/3 rounds are B=2/4, far from that regime. (The MTP
+gate was re-measured after the `dflash_verify` fix below and now passes: 1.44x at k=2.) The
+long-window upside belongs to n-gram lookups with long exact matches (code blocks, quoted lists,
+repeated paragraphs).
 
 **Configs/memory.** Razer `~/models/stage-310-razer-k7-f16-sk32.toml`; Strix
 `/home/m/swp/sweep/long32{,-split1,-nosplit}.toml`; probe `/tmp/kilo/row_once.py`, results
 `/tmp/kilo/curve-{fine,once,nosplit,split1}.json`, end-to-end logs `/tmp/kilo/spec*-para*.{txt,err}`.
 Raising `spec_k` to 16/32 on both stages is a config change only; the live `spec_k = 8` files were not
 modified.
+
+## Verify fast-path marker (`dflash_verify`) — MTP revived
+
+**Finding.** Kyojin's R-row verify fast paths are gated on `params["dflash_verify"]`; its own generator
+sets that key on every verify forward. The adapter set only `recurrent_history`, so every 2..8-row verify
+here took the generic multi-row route. That is why the flag sweep above (VERIFY_FUSE, DEC_MOE_UNION,
+VERIFY_GEMV_R, MOE_UNION_V2, MOE_VALU) moved nothing: the kernels those flags select were never reached.
+Upstream 1.6.4 has no such key, so the first stage (Razer) is unaffected either way.
+
+**Fix.** `swp_exl3/exl3_backend.py` sets `params["dflash_verify"] = True` for verify forwards (default;
+`SWP_VERIFY_FASTPATH=0` restores the old calls for a same-build A/B). Set it before `prepare_inputs`, as
+the engine's generator does.
+
+**Verify curve.** Model B cut 7, f32 wire, chunk 2048, warm stages, forced 100%-accept drafts; B = verify
+rows = k+1; 4 warm rounds, median wall.
+
+| B | marker off, ms | marker on, ms | stage 1 on, ms | change |
+|---|---|---|---|---|
+| 2 | 117.0 | **75.9** | 61 | −35% |
+| 3 | 139.0 | **85.7** | 69 | −38% |
+| 4 | 157.0 | **95.9** | 78 | −39% |
+| 5 | 174.0 | **128.0** | 110 | −26% |
+| 6 | 207.7 * | 140.0 | 118 | −33% |
+| 7 | 226.2 * | 148.0 | 127 | −35% |
+| 8 | 246.1 * | 156.1 | 134 | −37% |
+| 9 | 279.9 * | 231.7 | 202 | −17% |
+
+\* T6's `ROW_SPLIT=2` rows (same stage config). B=9 crosses the engine's 8-row caps (`MAX_BSZN` /
+`MAX_BSZN_GEMV_R`), so it is a cliff, not a row: the best n-gram window is **k=7 (B=8)**, not k=8.
+Stage 1 alone at B=2/3/4 is 61/69/78 ms (T6: ~101/135/158).
+
+**n-gram end-to-end.** 51-token repeated paragraph, 127 new tokens, greedy; steady state (second run):
+
+| k | rounds | accepted | decode tok/s | vs plain | output |
+|---|---|---|---|---|---|
+| plain | — | — | 14.98 | — | — |
+| 3 | 32 | 96/96 (100%) | 37.84 | 2.53x | byte-identical |
+| **7** | **16** | **112/112 (100%)** | **47.07 / 47.25** | **3.14x** | **byte-identical** |
+
+The first k=7 run after a stage start is 31.8 tok/s (one-time shape autotune on the 8-row kernels).
+
+**MTP end-to-end.** Model B, 149-token novel prompt, 127 new tokens, greedy, `mtp = true` +
+`mtp_cache_tokens = 8192`; plain is the same stage with MTP loaded:
+
+| k | rounds | accepted | accepted/depth | tok/s (2 runs) | vs plain |
+|---|---|---|---|---|---|
+| plain | — | — | — | 14.73 / 14.76 | — |
+| 1 | 73 | 50/73 (68.5%) | [50] | **19.51 / 19.55** | 1.33x |
+| **2** | **56** | **69/112 (61.6%)** | **[44, 25]** | **21.16 / 21.27** | **1.44x** |
+| 3 | 55 | 71/165 (43.0%) | [39, 22, 10] | 18.69 | 1.27x |
+
+k=2 is the best point; the per-round budget is 86 ms verify + ~2 ms catch-up + ~7.4 ms drafter for
+2.23 tokens. Every k clears the 1.15x MTP gate that stopped S3 (then 15.5 tok/s, 1.03x). Capacity:
+117.63 GB allocated, **8.85 GB free** (MTP block 3.7 GB + embedding 1.27 GB + 8192-token drafter
+cache); the shared `eh_proj` sidecar was present. MTP text is **not** byte-identical to plain greedy
+(first divergence at "helpful" vs "help" for all three k); n-gram was identical on every run.
+
+**Correctness.** `swp-exl3 smoke` passes its golden prompts and top-64 logits (top-1 equal, 64/64, KL 0)
+but **fails the spec line**: 20 rows at k=3, **1 top-1 mismatch, max KL 1.95e-3** (gate: top-1 equal and
+KL ≤ 1e-2). This is a near-tie flip, not the S2 gross failure (that was KL 2.25 before `rewind(0)`).
+The pre-marker engine fails the same way at k=2 and k=4 on this prompt (0 at k=3, by luck), so the gate
+was already sampling the engine's floor. Two contributors, measured separately:
+
+* **Stage 0 (Razer, upstream 1.6.4) has no exact R-row verify.** Its boundary hidden vs R 1-row
+  forwards differs by max |Δ| 5.4e-4 (R=2), 8.2e-4 (R=3), 1.6e-3 (R=4), 3.3e-3 (R=5).
+* **Stage 1 (Kyojin + marker)** is close but not bitwise. Fed the *same* stage-0 rows, verify vs
+  sequential gives max KL 7.8e-6 (R=2), 3.1e-3 (R=3), 4.4e-4 (R=4), top-1 equal in that sample.
+
+So the marker removes the generic-path cost and most of the drift, but "bit-exact" does not hold
+end-to-end on this heterogeneous pair. A bit-identical speculative run needs an exact R-row verify on
+the first stage too (upstream 1.6.4 does not have one), or a single-engine pair.
+
+**Files.** `swp_exl3/exl3_backend.py` (`verify_fastpath`, the `dflash_verify` marker). MTP stage config
+`/home/m/swp/stage-310-strix-k7-mtp.toml`. Probes (outside the repo): `/tmp/kilo/verify_probe.py`
+(curve), `stage0_check.py` (stage-0 hidden), `pair_exact.py` (stage-1 isolation), logs
+`/tmp/kilo/{gen-spec7*,mtp-*,smoke-mtp*}`.
+
+## MTP as the n-gram fallback (policy)
+
+**Decision.** MTP is enabled on the head stage but used only when the n-gram lookup misses. Every round
+tries the free prompt lookup first; on a miss, the head's pending MTP drafts fill the window.
+The two windows are independent: n-gram uses `--spec-k` (default 3, capped by the stages' `spec_k`) and
+MTP uses `--spec-mtp-k` (default 2). `--no-mtp` / `SpecConfig.use_mtp = false` keeps exact n-gram only.
+`--spec` stays opt-in for now: the default `generate` request is still plain decode, and
+`swp-kyojin-server` still requires `--spec`. The Strix template ships `mtp = true`; the portable
+`StageConfig.mtp` code default stays `false` (upstream head stages have no `Glm5NextMTPModel`).
+
+**Why.** The marker results above show the complement: n-gram wins on repetitive text (k=7: 47.1 tok/s,
+3.14x, byte-identical) and is free on novel text (miss -> plain decode); MTP with `dflash_verify` wins
+where the lookup misses (k=2: 21.16/21.27 vs 14.73/14.76 plain, 1.44x). MTP-first would pay the ~7.4 ms
+drafter and ~2 ms catch-up every round and discard the larger n-gram win.
+
+**Accounting.** `Pipeline.generate` reports `spec_rounds` split into `spec_ngram_rounds`,
+`spec_mtp_rounds`, and `spec_plain_rounds`, with matching `*_drafted` / `*_accepted` counters (they sum
+to the totals); `spec_lookup_hits` / `spec_lookup_len_total` expose weak 1–2-token matches, and
+`spec_ngram_verify_ms` / `spec_mtp_verify_ms` / `spec_mtp_roll_ms` split the time. `swp-kyojin-server`
+prints the compact mix (`| spec n-gram 12r 44/44 | mtp 4r 9/12 | plain 1`) and `--spec-log FILE` appends
+one JSON object per request for aggregation (rotating at 64 MiB, two backups).
+
+**Cache guard.** When MTP is enabled, `mtp_cache_tokens` must be >= `cache_tokens` (checked in
+`config.load_stage` for `mtp = true` and in `Exl3Backend._init_mtp`), and the drafter's prefill/roll
+check `pos + rows` against its cache with a clear error. The drafter mirrors the target cache; a smaller
+one overflows on a long prompt. `examples/stage-strix.toml` keeps its 64k cache and pairs
+`mtp_cache_tokens` at 64k; the measured 8k MTP profile sets both to 8192.
+
+**Draft-window clamp.** `STAGE_READY` now advertises each stage's `cache_tokens`; the coordinator uses
+the smallest value. Before every round it caps the n-gram/MTP draft list to
+`cache_tokens - (len(history) + 1)`, and caps the next MTP roll to leave one row for the next verify
+(worst case: every draft accepted). A speculative round therefore never needs more rows than plain
+decode; a request whose prompt + generation genuinely exceeds the cache still returns the real
+`context_exceeded` error.
+
+**Smoke gate.** The spec line now classifies a top-1 mismatch as a near-tie when the verify top-1 is in
+the reference top-k and the reference top-1 is within 0.1 logits. The gate is zero non-near-tie flips,
+KL <= 1e-2, and near-ties capped at 10% of rows (at least one); the count and budget are printed. This
+keeps the S2 gross failure (KL 2.25) and the golden logit check strict, while still failing a systematic
+near-tie pattern. The earlier smoke failure with MTP loaded (1 flip, KL 1.95e-3) was the batched-kernel
+floor: the pre-marker engine fails the same way at k=2/4.
+
+**Live validation (cache 8192, MTP loaded).** Razer `[0,7)` + Strix `[7,45)`, f32, chunk 2048,
+`mtp = true`, `mtp_cache_tokens = 8192` (both stages cache 8192). Short prompts: the 149-token smoke
+prompt and a 42-token repetitive code prompt, 48 new tokens. The 8k rows use an 8000-token prompt + 128
+new (8128 total). A pure 8192-token prompt cannot generate with cache 8192; the earlier 8064+128 spec
+attempt failed at `forward needs 8193`, which the draft-window clamp below fixes (the same run now
+completes normally).
+
+| test | plain PP / TG tok/s | `--spec` PP / TG tok/s | spec mix |
+|---|---|---|---|
+| short novel, 149 tok | 158.7 / **14.95** | 171.1 / **19.71** (1.32x) | n-gram 4r 7/12, mtp 17r 17/34, plain 3 |
+| short repetitive, 42 tok | 88.9 / **15.09** | 91.4 / **28.02** (1.86x) | n-gram 16r 32/48 |
+| 8k novel, 8000+128 | 455.9 / **14.58** | 454.8 / **14.29** (0.98x) | n-gram 40r 8/120, mtp 25r 34/50, plain 22 |
+| 8k repetitive, 8000+128 | 476.8 / **14.53** | 476.2 / **28.02** (1.93x) | n-gram 43r 87/129 |
+
+Pure 8192-token prefill (`--max-new 1`): **433.3 tok/s novel**, **478.7 tok/s repetitive**.
+
+* The MTP fallback works: the short novel run used 17 MTP rounds (17/34 accepted) after the n-gram
+  lookup missed, and reached 1.32x plain.
+* Draft-window clamp: the previously failing 8064+128 spec run now completes (127 new tokens,
+  14.59 tok/s, 80 rounds, no `context_exceeded`); the last verify/MTP windows are shortened
+  automatically.
+* Repetitive output is byte-identical to plain at both 42 and 8k tokens.
+* The 8k novel spec row is slightly **slower** than plain. The mix explains it: 40 n-gram rounds
+  proposed 120 drafts but accepted only 8 (6.7%), and every hit suppressed MTP. The MTP rounds themselves
+  were good (34/50). This is the 2-gram precision problem, not MTP.
+* A diagnostic probe using `SpecConfig` with only 3-gram or 4-gram lookup reached **18.14** and **20.06**
+  tok/s on the same 8k novel prompt, with 48/47 MTP rounds. `--spec-match 3`/`4` did not reproduce that
+  because `SpecConfig.propose` still fell back to a 2-gram match. The strict floor now removes that
+  fallback and defaults to 4; see "Strict n-gram match floor" below for the CLI reproduction.
+* `smoke` **PASS**: golden prompts identical; spec check 0 non-near-tie flips, 1 near-tie (budget 2),
+  max KL 1.95e-3. Novel `--spec` output differs from plain (MTP is not exact). `--no-mtp` also diverged
+  from plain on the short novel prompt at a batched-verify near-tie; n-gram exactness is not guaranteed
+  on novel prose, though every repetitive run was identical.
+
+**Open validation.** The agent-trace mix (10–20 real requests, n-gram `--spec-k 3/7/8`) and the decision to
+enable `--spec` by default in `swp-kyojin-server` are still pending. The strict n-gram floor is now
+implemented and measured in the next section.
+
+## Strict n-gram match floor (Phase 1)
+
+**Decision.** `--spec-match` / `SpecConfig.match` is a **strict minimum match length**: `propose` calls
+`ngram_drafts(context, k, match)` only, and returns no drafts when the last `match` tokens have no earlier
+occurrence. The implicit 2-gram fallback is gone. The default floor is **4**, chosen by the rule below;
+`--spec-match 2` is the aggressive opt-in and a very large value (`--spec-match 99`) is MTP-only. `k`
+(`--spec-k`, verify window `k+1` rows) is unchanged and separate from `n` (match length); the coordinator
+still clamps `k` to the stages' advertised `spec_k` and does not hardcode a Kyojin ceiling.
+
+**Why.** On long novel prose, 2-gram matches are everywhere but rarely predict the continuation, and any
+hit suppresses MTP (the 8k prose row was 40 n-gram rounds for 8/120 accepted and 14.29 tok/s vs 14.58
+plain). With the old code, `--spec-match 3`/`4` still ran the 2-gram lookup first, so the CLI could not
+reproduce the 18.14/20.06 tok/s probe. The strict floor makes the flag mean what it says.
+
+**Method.** Real pair: Razer `[0,7)` + Strix `[7,45)`, f32, chunk 2048, both caches 8192, head stage
+`mtp = true`, `mtp_cache_tokens = 8192`, `k = 3`, `--spec-mtp-k 2`, greedy, 128 new tokens, warm stages.
+Prompts are built from this project by `/tmp/kilo/make_prompts.py`, not fiction: the 149-token prose
+prompt from `SMOKE_BENCH_PROMPT` (reproduces the old short-novel baseline), short code (267 tokens
+from the speculative loop in `coordinator.py`), short plan (314 tokens from this plan), short repetitive
+code (155 tokens of `def step_i` lines), 8k code (8000 tokens of distinct project source), 8k plan
+(8000 tokens of `.kilo/plans/` + `README`/`RESULTS`/`BRINGUP`/`MEASUREMENTS`), 8k repetitive test code
+(8000 tokens where only the literals change). Plain TG is 14.4–14.9 tok/s on every prompt, within the
+old prose baselines (14.53–15.09), so the pair had not drifted. Every run below uses the CLI
+(`--spec --spec-match N`), reproducing the earlier custom-drafter probe.
+
+| prompt | plain | strict 3 | strict 4 | MTP-only (99) |
+|---|---|---|---|---|
+| prose, 149 tok (`SMOKE_BENCH_PROMPT`) | 14.88 | 19.23 | 19.66 | **22.13** |
+| short code, 267 tok | 14.75 | 21.95 | 21.57 | **24.85** |
+| short plan, 314 tok | 14.76 | 19.43 | 20.61 | **20.88** |
+| short repetitive, 155 tok | 14.74 | 21.82 | 21.80 | — |
+| 8k code, 8000+128 | 14.43 | 18.62 | 22.55 | **23.89** |
+| 8k plan, 8000+128 | 14.47 | 27.18 | **27.77** | 24.87 |
+| 8k repetitive, 8000+128 | 14.43 | 23.41 | **26.87** | — |
+| 8k code + cache-edge, 8064+128 | — | 19.44 | — | — |
+
+The 149-token prose prompt also shows the strict floor working as intended: 61 MTP rounds and one
+n-gram round (2/3 accepted), versus the old fallback's 4 n-gram rounds / 7 of 12 accepted and 19.71
+tok/s. MTP-only is faster still here (22.13), so on that prompt the n-gram path is not earning its
+rounds, but it costs only 11% versus MTP-only and is 32% above plain.
+
+Mix at 8k (rounds, accepted/drafted by source):
+
+| prompt | policy | rounds | n-gram | MTP | plain | lookup hits |
+|---|---|---|---|---|---|---|
+| code | strict 3 | 65 | 25r 23/75 | 22r 41/44 | 18 | 25 |
+| code | strict 4 | 53 | 10r 11/30 | 34r 64/68 | 9 | 10 |
+| code | MTP-only | 46 | — | 45r 82/90 | 1 | 0 |
+| plan | strict 3 | 42 | 38r 82/114 | 2r 4/4 | 2 | 38 |
+| plan | strict 4 | 41 | 34r 79/102 | 4r 8/8 | 3 | 34 |
+| plan | MTP-only | 44 | — | 43r 84/86 | 1 | 0 |
+| repetitive | strict 3 | 51 | 39r 65/117 | 6r 12/12 | 6 | 39 |
+| repetitive | strict 4 | 45 | 33r 71/99 | 6r 12/12 | 6 | 33 |
+
+**Break-even.** The earlier prose probe put an MTP k=2 round at ~95 ms for ~1.36 accepted drafts/round
+(2.36 tokens including the bonus), so an n-gram k=3 round (B=4, ~95.9 ms) needed about the same rate to
+pay for itself. On this pair MTP is stronger: 82/90 = 1.82 accepted/round on 8k code and 84/86 = 1.95 on
+8k plan. Strict 3 still spent 25 code rounds on 23/75 = 0.31 accepted/round, below break-even; strict 4
+cut those to 10 rounds (11/30 = 0.37) and gave MTP 12 more rounds, hence 18.62 -> 22.55 tok/s. On plan
+text n-grams carry their weight (34r, 79/102 = 0.77), so both floors beat MTP-only. No fixed 1.2 is
+hardcoded: the floor is chosen from measured tokens/ms by source, as here.
+
+**Floor rule.** Best 8k "novel" (project) TG with no more than 3% loss on the repetitive prompts versus
+the other floor. Strict 4 wins 8k code (+21%) and 8k plan (+2%) and wins or ties both repetitive prompts
+(short 21.80 vs 21.82, 8k 26.87 vs 23.41); its only loss is short code, 21.57 vs 21.95 (-1.7%, inside
+the 3% budget). **The default is therefore 4.** `--spec-match 3` remains useful for plan/prose-like text
+where 3-grams are reliable, and `2` is the aggressive opt-in.
+
+**MTP-only beats both floors on prose and code.** On the 149-token prose prompt (22.13 vs 19.66), 8k
+code (23.89 vs 22.55) and short code (24.85 vs 21.57), disabling n-gram (`--spec-match 99`) beats strict
+4, while on plan text it loses (24.87 vs 27.77) and on repetitive code it loses badly. That is the
+expected shape: n-gram only earns its place when its accepted-drafts/round clears the measured MTP rate,
+which code at k=3 does not. Reported rather than hidden; a future adaptive policy (Phase 2) is the way
+to pick per-round, not a lower fixed floor. The default stays 4 because it is the best n-gram floor and
+still wins clearly on repeated/plan-like text, which is the workload n-gram is for.
+
+**Exactness and regression.** Repetitive output at 155 and 8000 tokens is **byte-identical** to plain
+with strict 4 (diffed stdout). Novel/project code and plan text can differ from plain on a batched-verify
+near-tie, and MTP output is not guaranteed exact; `--no-mtp` remains the n-gram-only escape hatch. The
+previous failure case, 8064 prompt + 128 new with cache 8192, completes under strict 3 (127 new tokens,
+19.44 tok/s, 63 rounds, no `context_exceeded`); the draft clamp is still in force. `smoke` **PASS** on
+the same stages: golden prompts identical, 20 verify rows with 0 non-near-tie flips, 1 near-tie (budget
+2), max KL 1.95e-3. Local suite: 64 tests OK (1 skipped). Kyojin HTTP suite: 17 tests OK.
+
+**Kyojin k ceiling (measured earlier, still current).** B=9 (k=8) crosses the engine's 8-row caps:
+verify is 231.7 ms vs 156.1 ms at B=8. Use `--spec-k 7` for repetitive n-gram work; the default stays 3.
+This is a deployment measurement, not a coordinator invariant: the backend/config `spec_k` remains the
+authority and the coordinator only clamps to it.
+
+
+## Verify-row flag sweep re-run (marker ON) — the "nothing helps" T6 result is void, and one flag *was* hidden
+
+**Why.** The T6 sweep ("Verify-row flag sweep (2–4 rows)") and the T6 rows curve concluded the multi-row
+knobs are all neutral. Every flag they tested selects a kernel *inside* the engine's R≥2 verify path,
+and that path was never reached: the adapter did not set `params["dflash_verify"]`, the marker Kyojin's
+own generator sets on every verify forward (previous section). With the marker now on by default, the
+sweep is re-run over a wider window, B = 2..8 rows.
+
+**Setup.** Model B cut 7, f32 wire, chunk 2048, Razer `[0,7)` stage 0 + Strix `[7,45)` stage 1, warm
+stages. Each arm is a **fresh Strix stage load** with that arm's `[stage.env]` (the flags are read at
+import / in C++ static init, so one process per arm). The probe resets, prefills one fixed prompt
+("The capital of France is"), then runs forced-100%-accept verify rounds at B = 2..8 (the known greedy
+continuation is supplied as the drafts), 2 discarded + 6 measured rounds per B, reporting the **median
+wall ms** and the head stage's `stage_ms`; `mism` is verify top-1 ≠ sequential-greedy top-1 summed over
+all rows. The base arm is the sweep base config (`/home/m/swp/sweep/base.toml`: the 32-flag SPEED_ENV
+including `EXL3_VERIFY_ROW_SPLIT=2`), marker on. Base **reproduces the published marker-on curve**
+(75.3/85.3/97.1/129.9/140.0/149.4/159.7 ms vs 75.9/85.7/95.9/128.0/140.0/148.0/156.1), so the harness
+is calibrated to the previous section.
+
+**Wall ms per verify round (median), B = verify rows:**
+
+| arm | B=2 | B=3 | B=4 | B=5 | B=6 | B=7 | B=8 | mism |
+|---|---|---|---|---|---|---|---|---|
+| **base** (control) | **75.3** | **85.3** | **97.1** | **129.9** | **140.0** | **149.4** | **159.7** | 8 |
+| `EXL3_HIP_PREFILL_MIN_ROWS=17` | 76.0 | 84.9 | 97.5 | 128.8 | 142.1 | 151.3 | 160.2 | 8 |
+| `EXL3_DEC_MOE_UNION=1` | 75.7 | 85.1 | 98.1 | 129.1 | 143.8 | 152.0 | 159.6 | 8 |
+| `EXL3_MOE_VALU=1` | 77.8 | 86.7 | 99.1 | 128.5 | 139.2 | 150.2 | 158.4 | 12 |
+| `EXL3_MOE_R8=1` + `GEMV_R_RM6=1` (serve trio) | 76.2 | 86.3 | 97.6 | 131.3 | 142.9 | 151.1 | 160.4 | 8 |
+| `EXL3_MOE_R8=1` | 76.4 | 86.3 | 97.0 | 129.7 | 138.6 | 149.6 | 158.0 | 8 |
+| `EXL3_VERIFY_GEMV_R=1` | 77.3 | 86.1 | 97.4 | 130.6 | 142.8 | 151.1 | 160.5 | 8 |
+| `EXL3_DEC_ROUTER_ROWS=1` | 77.6 | 88.1 | 99.9 | 133.2 | 143.1 | 153.7 | 164.6 | 8 |
+| `EXL3_DEC_ROUTER_ROWS=0` | 81.9 | 90.8 | 102.2 | 134.9 | 144.3 | 152.8 | 161.8 | 6 |
+| `EXL3_VERIFY_ROW_SPLIT=0` | 76.1 | 86.4 | 97.7 | 134.0 | 145.5 | 154.1 | 164.8 | 8 |
+| `EXL3_VERIFY_ROW_SPLIT=1` | 77.4 | 86.3 | 97.3 | 135.6 | 146.1 | 157.7 | 168.2 | 8 |
+| **`EXL3_MOE_UNION_V2=0`** | **96.4** | **112.5** | **130.7** | **169.8** | **189.2** | **205.9** | **217.3** | 10 |
+
+**Stage 1 (Strix) ms per round** (stage 0 is 8–15 ms and unchanged; all the movement is here):
+
+| arm | B=2 | B=3 | B=4 | B=5 | B=6 | B=7 | B=8 |
+|---|---|---|---|---|---|---|---|
+| base | 61.6 | 69.7 | 79.4 | 111.7 | 119.8 | 128.9 | 137.2 |
+| MIN_ROWS=17 | 61.7 | 69.6 | 79.9 | 111.5 | 121.9 | 129.7 | 138.0 |
+| DEC_MOE_UNION=1 | 61.4 | 69.7 | 79.5 | 111.0 | 122.1 | 129.7 | 137.6 |
+| MOE_VALU=1 | 62.6 | 70.3 | 80.6 | 109.2 | 118.9 | 128.2 | 137.6 |
+| serve trio | 61.8 | 70.1 | 79.8 | 111.6 | 122.0 | 129.8 | 137.8 |
+| MOE_R8=1 | 61.6 | 69.8 | 79.3 | 111.5 | 119.3 | 129.0 | 135.9 |
+| VERIFY_GEMV_R=1 | 61.8 | 69.7 | 79.7 | 111.5 | 122.2 | 129.3 | 138.1 |
+| DEC_ROUTER_ROWS=1 | 62.3 | 71.3 | 81.8 | 113.5 | 122.2 | 132.1 | 141.2 |
+| DEC_ROUTER_ROWS=0 | 67.6 | 75.1 | 84.7 | 115.9 | 123.9 | 130.7 | 139.8 |
+| ROW_SPLIT=0 | 61.5 | 69.7 | 80.0 | 114.6 | 124.4 | 132.6 | 142.5 |
+| ROW_SPLIT=1 | 61.7 | 69.9 | 79.7 | 116.2 | 125.5 | 135.8 | 145.5 |
+| MOE_UNION_V2=0 | 81.1 | 96.2 | 113.7 | 150.8 | 168.3 | 184.5 | 194.8 |
+
+**No arm flattens the B=5 bump.** The B=4→5 step and the per-row slope (B=2→4, B=5→8) for every arm:
+
+| arm | B=2→4 /row | **B=4→5** | B=5→8 /row |
+|---|---|---|---|
+| base | 10.9 | **+32.8** | 9.9 |
+| MIN_ROWS=17 | 10.8 | +31.4 | 10.4 |
+| DEC_MOE_UNION=1 | 11.2 | +31.0 | 10.2 |
+| MOE_VALU=1 | 10.6 | +29.4 | 10.0 |
+| serve trio | 10.7 | +33.7 | 9.7 |
+| MOE_R8=1 | 10.3 | +32.7 | 9.4 |
+| VERIFY_GEMV_R=1 | 10.1 | +33.2 | 9.9 |
+| DEC_ROUTER_ROWS=1 | 11.2 | +33.2 | 10.5 |
+| DEC_ROUTER_ROWS=0 | 10.1 | +32.7 | 8.9 |
+| ROW_SPLIT=0 | 10.8 | +36.2 | 10.3 |
+| ROW_SPLIT=1 | 10.0 | +38.3 | 10.9 |
+| MOE_UNION_V2=0 | 17.2 | +39.1 | 15.9 |
+
+**Findings.**
+
+* **Nothing flattens the B=5 bump.** The 4→5-row step is **+29…+39 ms in all 12 arms** (base +32.8),
+  and the 5→8-row marginal returns to ~9–11 ms/row everywhere — exactly as in the marker-on curve. The
+  "B=5 is the 4-row instantiation limit, so one of these may flatten it" hypothesis is **not supported**:
+  the knobs that *literally* sit on a 4-row boundary do not reduce the step.
+  * `EXL3_DEC_ROUTER_ROWS` (the router's one-launch loop is capped at **4** rows): `=0` (per-row router)
+    is the *worst* of the small arms (+6.6 ms at B=2, +4..5 ms at B≥4); `=1` is +2..+5 ms worse than the
+    base's `=2` at every B. The one-launch multi-row router is already the fast choice, so the 5-row step
+    is not a router-instantiation limit.
+  * `EXL3_HIP_PREFILL_MIN_ROWS=17` (every ≤16-row forward uses the decode kernel instead of the grouped
+    prefill path): B=5 **128.8** vs 129.9 — within noise; the step stays +31.4.
+  * `EXL3_VERIFY_ROW_SPLIT=0/1` (the base's `=2` splits rows 5–8 into ≤4-row fused sub-calls):
+    both are *worse* at B≥5 (+4.1 / +5.7 at B=5; +5.1 / +8.5 at B=8), confirming `=2`. Rows 5–8 are
+    already served by ≤4-row instantiations, yet B=5 still jumps — so the step is not the MoE/GEMV
+    4-row instantiation these split.
+* **`EXL3_MOE_UNION_V2` is the one flag the missing marker hid, and it is already on.** Setting it `=0`
+  costs **+21 ms at B=2, growing to +57.7 ms at B=8 (1.36×)**; the per-row marginal nearly doubles
+  (2→4 rows 10.9 → 17.2 ms/row; 5→8 rows 9.9 → 15.9). It does **not** change the B=5 step
+  (+39.1 vs +32.8): V2 is the union-MoE dedup for the whole R≥2 path, not a 4/5-row boundary. This
+  vindicates the "the flags sat behind the marker" premise — for V2 at least, whose T6 verdict was
+  "neutral / +9 %" against a path it never entered.
+* **`EXL3_MOE_R8` (one-launch 8-row fused MoE) and the serve.py trio (`MOE_R8=1` + `GEMV_R_RM6=1`) are
+  neutral** (B=5 129.7 / 131.3 vs 129.9; B=8 158.0 / 160.4 vs 159.7): the 8-row MoE and 6-row dense-GEMV
+  instantiations buy nothing on this prompt. `EXL3_DEC_MOE_UNION=1`, `EXL3_VERIFY_GEMV_R=1` and
+  `EXL3_MOE_VALU=1` are likewise within run-to-run noise (±2–3 ms; base was measured twice at
+  75.26/85.29/97.11/129.92 and 75.41/86.33/97.35/129.97). The union MoE path is clearly exercised at
+  baseline (see the V2 arm), so `DEC_MOE_UNION`/`VERIFY_GEMV_R` gating adds nothing on top.
+* **Interpretation.** With the marker on, R=1→2 costs ~+10 ms, R=4→5 costs ~+33 ms, then R=5→8 is back
+  to ~10 ms/row, and **all of it is on the Strix stage**. Since `ROW_SPLIT=2` already splits 5–8 rows
+  into ≤4-row calls and the router is already one-launch, the 5-row step is not in the MoE/router
+  kernels these flags select; it is in the remaining per-row work (the R≥2 path switch itself, the
+  MLA/GDN projection row loops, dense GEMV, hc-mixer) or a batch-4→5 instantiation outside the MoE.
+  Practically: keep the n-gram window at **B=4 or B≥6**; kite B=5 (pay +33 ms for one row).
+
+**Correctness.** Forced-draft rounds, verify top-1 vs the sequential greedy continuation: 6–12
+mismatches per arm over 7 B × 6 rounds × B rows (base 8, `MOE_VALU` 12, `MOE_UNION_V2=0` 10). This is
+the same batched-kernel near-tie floor as the published marker-on run; no arm is a numerics regression.
+
+**Decision / config.** No live stage config changes. `EXL3_MOE_UNION_V2` stays at its default **1** (worth
+making explicit in the Strix `[stage.env]` so a future Kyojin default flip cannot disable it silently);
+`EXL3_VERIFY_ROW_SPLIT=2`, `EXL3_DEC_ROUTER_ROWS=2`, `EXL3_VERIFY_FUSE=1` stay as they are. `EXL3_MOE_R8`
+/ `EXL3_GEMV_R_RM6` are inert on this prompt — matching serve.py is safe but not a gain. The B=5 bump
+remains the largest unaddressed verify inefficiency for windows of k=4.
+
+**Files.** Arm configs on the Strix: `/home/m/swp/sweep/{base,moe_r8,row_split0,row_split1,dec_moe_union,
+verify_gemv_r,union_v2_0,moe_valu,serve_trio,router0,router1,min_rows17}.toml` (each generated from
+`base.toml` by a single-key override). Harness (outside the repo): `/tmp/kilo/row_sweep.py`; drivers
+`/tmp/kilo/run_sweep.sh` and `run_all.sh`; results `/tmp/kilo/sweep-<arm>.json` (12 files); logs
+`/home/m/swp/sweep/<arm>.log`. No live stage config was modified; the driver only writes to
+`/home/m/swp/sweep/`. All stages were stopped after the run.
