@@ -186,6 +186,7 @@ class T(unittest.TestCase):
         d = tempfile.mkdtemp()
         path = os.path.join(d, "spec.jsonl")
         self.engine.spec_log = path
+        self.engine.spec = SpecConfig(k=3, match=4, mtp_k=2)
         async def go():
             async with TestClient(TestServer(self.app)) as c:
                 r = await self.post(c, [{"role": "user", "content": "hi"}], ignore_eos=True, max_tokens=4)
@@ -199,6 +200,7 @@ class T(unittest.TestCase):
         self.assertIn("timestamp", rec)
         self.assertIn("prompt_tokens", rec)
         self.assertIn("spec_ngram_rounds", rec)
+        self.assertEqual(rec["spec_match"], 4)
 
     def test_spec_log_rotates(self):
         d = tempfile.mkdtemp()
@@ -225,6 +227,12 @@ class T(unittest.TestCase):
         self.assertEqual(a.spec_mtp_k, 4)
         self.assertTrue(a.no_mtp)
         self.assertEqual(a.spec_log, "s.jsonl")
+
+    def test_spec_match_parser_default_and_override(self):
+        a = sks.build_parser().parse_args(["--pipeline", "p.toml", "--model-dir", "m"])
+        self.assertEqual(a.spec_match, 4)
+        a = sks.build_parser().parse_args(["--pipeline", "p.toml", "--model-dir", "m", "--spec-match", "5"])
+        self.assertEqual(a.spec_match, 5)
 
     def test_num_draft_is_the_larger_window(self):
         e = sks.PipelineEngine(self.pipe, self.tok, ctx=4096, eos_ids=[63], seq_factory=lambda ids: list(ids),

@@ -9,15 +9,19 @@ only swp-exl3 change it needed was additive (`Pipeline.generate` now also report
 ## Run (on the Strix, in Kyojin's venv, with swp_exl3 installed there)
     python swp_kyojin_server.py --pipeline pipeline.toml --model-dir /models/GLM-5.3-Flash-exl3 \
         --kyojin-root ~/engines/kyojin --ctx 8192 --host 127.0.0.1 --port 8000 \
-        [--spec] [--spec-k 3] [--spec-mtp-k 2] [--spec-match 2] [--no-mtp] [--spec-log FILE]
+        [--spec] [--spec-k 3] [--spec-mtp-k 2] [--spec-match 4] [--no-mtp] [--spec-log FILE]
 `--ctx` must be the SMALLEST stage `cache_tokens` (8192 in this example). For the measured long-context
 configs set both stages and `--ctx` to the same larger value; see `RESULTS.md` T5. Start the two stage servers first.
 Template: `--chat-template FILE`, else Kyojin's `tools/lanes/assets/glm53-template-medium.jinja`, else `<model>/chat_template.jinja`.
 `--spec` enables the pipeline's speculative decoding: prompt-lookup (n-gram) first, then the head stage's MTP
-drafter as the fallback on novel text. `--spec-k` is the n-gram window and `--spec-mtp-k` the independent MTP
-window (default 2); `--spec-match` is the preferred n-gram length (default 2, currently falling back to a
-2-gram match for longer values; 2-gram hits can be weak on long novel prose). `--no-mtp` keeps exact n-gram only.
-Repetitive text stays byte-identical and speeds up ~1.7x; novel prose can differ on a batched-verify near-tie.
+drafter as the fallback. `k` (`--spec-k`, default 3) is the number of drafts per round; the verify window is
+`k+1` rows. `n` (`--spec-match`, default **4**) is a **strict minimum match length**: the last `n` tokens must
+already occur earlier in the context, and there is no shorter fallback, so a weak 3-gram cannot suppress MTP.
+`--spec-match 2` is the aggressive opt-in (old 2-gram lookup); a very large value (`--spec-match 99`) turns
+the n-gram path off and leaves MTP/plain. `k` is not `n`: for repetitive n-gram work use `--spec-k 7`; `k = 8`
+(B = 9) crosses Kyojin's 8-row caps (verify 232 ms vs 156 ms at B = 8). `--spec-mtp-k` is the independent MTP
+window (default 2). `--no-mtp` keeps exact n-gram only. Repetitive text stays byte-identical and speeds up
+~1.5-1.9x; novel prose can differ from plain on a batched-verify near-tie, and MTP output is not guaranteed exact.
 `--spec-log FILE` appends one JSON object per request (`last_stats`, `timestamp`, `request` id),
 rotating at 64 MiB and keeping two backups.
 
@@ -40,7 +44,8 @@ appears only when the request drafted: `n-gram`/`mtp` show rounds and accepted/d
 1-token decodes with no draft. `usage.prompt_tokens_details.cached_tokens`
 reports only tokens that were actually reused: a clear+replay sets it to 0 even when the logical prefix was longer.
 `Pipeline.generate` also returns `rollback` and `replayed_tokens`; the server copies both into `last_stats`, along
-with the per-source counters (`spec_ngram_*`, `spec_mtp_*`, `spec_plain_rounds`, `spec_lookup_*`).
+with the per-source counters (`spec_ngram_*`, `spec_mtp_*`, `spec_plain_rounds`, `spec_lookup_*`) and the
+active floor (`spec_match`, so a `--spec-log` records the policy).
 With GLM's medium template, a client that wants a cache hit on the next turn should echo the previous
 `reasoning_content` back in the assistant message; if it sends only `content`, the rendered prompt differs inside the
 reply and the turn is replayed (expected).
@@ -50,7 +55,8 @@ reply and the turn is replayed (expected).
 Covers: endpoints, non-stream output equals a direct pipeline run, stream equals non-stream, stop strings, multi-turn
 append without replay, replay accounting on a trim (`cached_tokens = 0`, `replayed_tokens = kept`), exact-id splicing
 and its fallbacks, cancel mid-stream, one-time warning for unsupported samplers, the terminal HIT/MISS/rate/spec line,
-the source mix, `--spec-log` JSONL and rotation, and the `--spec-mtp-k` / `--no-mtp` flags. 16 tests.
+the source mix, `--spec-log` JSONL and rotation (including `spec_match`), and the `--spec-mtp-k` / `--spec-match` /
+`--no-mtp` flags. 17 tests.
 torch is stubbed only if it is not installed.
 
 ## Agent / chat-UI use
@@ -70,7 +76,8 @@ use `--host 0.0.0.0` on a machine that is on the internet.
 * Sampling is whatever the head stage returns (top-64): temperature, top_p, top_k, seed. min_p, penalties, logit_bias,
   grammar are ignored (logged once). No images. One request at a time (Kyojin's handler queues the rest).
 * MTP is wired as the `--spec` fallback (head stage `mtp = true`, Kyojin `Glm5NextMTPModel`); `--no-mtp` keeps
-  exact n-gram only. The n-gram path is neutral on novel text and ~1.7x faster on repetitive output; MTP is
-  ~1.44x on novel text but is **not** guaranteed byte-identical to plain greedy (see `RESULTS.md`).
+  exact n-gram only. The n-gram path is neutral on novel text and ~1.5-1.9x faster on repetitive output; the
+  strict floor (`--spec-match 4`) avoids the weak 2-gram rounds that used to suppress MTP. MTP is ~1.4-1.7x on
+  novel text but is **not** guaranteed byte-identical to plain greedy (see `RESULTS.md`).
 * Prefill is silent until the first token; set Kyojin's `KYOJIN_SSE_PING_S` if a client times out on long prompts.
 * Stage warm-up is a stage-server task (see the performance plan), not done here.

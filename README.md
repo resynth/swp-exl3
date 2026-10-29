@@ -226,10 +226,10 @@ swp-exl3 generate --pipeline FILE [--no-contract]
 | `--bench` | off | print prefill/decode tok/s and per-stage compute vs wire |
 | `--json` | — | write the bench report to a file (with `--bench`) |
 | `--spec` | off | speculative decode: prompt-lookup (n-gram) first, MTP fallback when the lookup misses |
-| `--spec-k` | `3` | n-gram drafts per verify round, capped by the stages' `spec_k` |
+| `--spec-k` | `3` | k: drafts per round; the verify window is `k+1` rows (capped by the stages' `spec_k`; measured Kyojin ceiling 7) |
 | `--spec-mtp-k` | `2` | MTP drafts per verify round when the n-gram lookup misses (independent of `--spec-k`) |
 | `--no-mtp` | off | exact n-gram drafting only; never ask the head stage for MTP drafts |
-| `--spec-match` | `2` | preferred n-gram match length; a longer value currently falls back to a 2-gram match |
+| `--spec-match` | `4` | n: minimum n-gram match length, **strict** — the last N tokens must already occur in the context (no 2-gram fallback) |
 
 ```bash
 export SWP_SECRET=...
@@ -249,6 +249,16 @@ swp-exl3 generate --pipeline examples/pipeline.toml --prompt-file prompt.txt \
 swp-exl3 generate --pipeline examples/pipeline.toml --prompt "Continue: red green blue red green blue" \
   --max-new 64 --spec --spec-k 3 --spec-mtp-k 2 --bench
 ```
+
+**Speculative drafting: n vs k.** `k` (`--spec-k`) is the number of drafts proposed per round; the verify
+forward has **`k + 1` rows**. `n` (`--spec-match`) is the match length: the last `n` tokens of the context
+must already occur earlier before the lookup trusts them. The default floor is **4** (`--spec-match 4`);
+`k = 7` is a 7-token draft window, **not** a 7-gram. The match is **strict** — there is no shorter
+fallback, so a weak 3-gram cannot pre-empt the MTP drafter just because `--spec-match 3` was requested.
+`--spec-match 2` is the aggressive opt-in that restores the old 2-gram lookup (plentiful but weak on novel
+text), and a very large value (`--spec-match 99`) disables n-gram drafting, leaving MTP/plain as a
+useful baseline. On Kyojin the useful n-gram maximum is `--spec-k 7`: `k = 8` makes B = 9 and crosses
+the engine's 8-row caps, so verify cost jumps from 156 ms to 232 ms.
 
 `--bench` output (per stage: device-synced compute vs wire+queue, and how much of the token the stage
 holds):
@@ -297,7 +307,7 @@ checkout (the Strix):
 ```bash
 python swp_kyojin_server.py --pipeline pipeline.toml --model-dir /models/GLM-5.3-Flash-exl3 \
   --kyojin-root ~/engines/kyojin --ctx 8192 --host 127.0.0.1 --port 8000 \
-  [--spec] [--spec-k 3] [--spec-mtp-k 2] [--no-mtp] [--spec-log FILE]
+  [--spec] [--spec-k 3] [--spec-mtp-k 2] [--spec-match 4] [--no-mtp] [--spec-log FILE]
 ```
 
 `--ctx` is the smallest stage `cache_tokens`. The server keeps history and reuses the longest common prefix, including
@@ -305,12 +315,12 @@ exact token ids of the previous reply, so appended turns prefill only the new te
 normal clear+replay and is reported as `replayed_tokens` (with `cached_tokens = 0`). Each request prints a terminal
 line with the cache verdict (`HIT n/m` / `MISS` / `MISS (replayed n)`), prefill tokens and tok/s (new and effective),
 decode tokens and tok/s, and — when drafting — the source mix (`spec n-gram 12r 44/44 | mtp 4r 9/12 | plain 1`).
-`--spec` enables the n-gram speculative path first and the head stage's MTP drafter as the fallback on novel
-text (`--spec-k` is the n-gram window, `--spec-mtp-k` the independent MTP window; `--no-mtp` keeps exact n-gram
-only). n-gram output was byte-identical on the repetitive runs; novel prose can differ on a
-batched-verify near-tie, and MTP output is not guaranteed to be. `--spec-log FILE`
-appends one JSON object per request (`last_stats` + `timestamp` + `request` id) for the agent-trace mix,
-rotating at 64 MiB and keeping two backups.
+`--spec` enables the n-gram speculative path first at the strict `--spec-match` floor (default 4) and the head
+stage's MTP drafter as the fallback (`--spec-k` is the draft window, `--spec-mtp-k` the independent MTP window;
+`--no-mtp` keeps exact n-gram only). n-gram output was byte-identical on the repetitive runs; novel prose can
+differ on a batched-verify near-tie, and MTP output is not guaranteed to be. `--spec-log FILE`
+appends one JSON object per request (`last_stats` + `timestamp` + `request` id, including `spec_match`) for the
+agent-trace mix, rotating at 64 MiB and keeping two backups.
 Tool calls work non-stream
 and streamed (`finish_reason: "tool_calls"`, `role: "tool"` follow-ups); `--ctx` (the smallest stage
 `cache_tokens`) is the context cap, and over-context prompts get a clean HTTP 400. The pair is not limited
@@ -530,8 +540,8 @@ Hybrid KDA linear attention (recurrent state) + MLA/DSA, MoE, **mHC hyper-connec
 * Single device per stage (`device = "cuda:0"`); autosplit loading is rejected (its dummy pass assumes
   token ids as input). CPU expert offload is likewise layer-split-only.
 * **Prompt-lookup (n-gram) speculative decoding is implemented** (SWP capability `spec`): the coordinator
-  proposes the next `k` tokens from an earlier occurrence of the last `--spec-match` tokens (default 2),
-  one verify forward
+  proposes the next `k` tokens (`--spec-k`, verify window `k+1` rows) from an earlier occurrence of the
+  last `--spec-match` tokens (default **4**, a strict minimum: no shorter fallback), one verify forward
   checks `k+1` rows on both stages, and rejected rows are rewound lazily on the next round (or by
   clear+replay when a stage cannot). Sampling (`temperature > 0`) uses "sample target, accept on equality" in
   the head stage. Verify forwards set Kyojin's `dflash_verify` marker, which enables its exact R-row kernels
@@ -543,15 +553,18 @@ Hybrid KDA linear attention (recurrent state) + MLA/DSA, MoE, **mHC hyper-connec
   **non-near-tie** flip (reference top-1 within 0.1 logits), and prints the near-tie count. n-gram output
   was byte-identical to plain greedy on the repetitive runs; a novel-prose run can still diverge on a
   batched-verify near-tie, and MTP output is not guaranteed to be. On long novel prose, 2-token matches
-  can be plentiful but weak (40 rounds, 8/120 accepted at 8k), which suppresses MTP; a strict 3/4-gram
-  floor is planned (RESULTS.md, "MTP as the n-gram fallback"). Both the verify and MTP draft windows are
-  clamped to the remaining stage cache, so speculation does not need extra context beyond plain
+  are plentiful but weak, and because any hit suppresses MTP a 2-gram lookup can make `--spec` slower
+  than plain; hence the strict floor (`--spec-match 2` opts back in, a huge value is MTP-only).
+  Measured on project code and plan text, the strict floor lifts 8k decode from 14.4 plain to 18.6
+  (`--spec-match 3`) and 22.6 tok/s (`--spec-match 4`), with the 4-gram default winning or tying on the
+  repetitive prompts (RESULTS.md, "Strict n-gram match floor"). Both the verify and MTP draft windows
+  are clamped to the remaining stage cache, so speculation does not need extra context beyond plain
   prompt + generation. A plain
   batched prefill shows the same class of delta — it is the engines' batched kernels, not SWP. No prefill
   pipelining across stages; star topology (coordinator relays).
 * **MTP drafting is the fallback under `--spec`** (head stage only; `mtp = true`; needs Kyojin's
-  `Glm5NextMTPModel`). Each round tries the free n-gram lookup first; on a miss it uses the head's MTP
-  drafts for the next round. The windows are independent: `--spec-k` (n-gram) and `--spec-mtp-k` (MTP,
+  `Glm5NextMTPModel`). Each round tries the free n-gram lookup first at the strict `--spec-match` floor;
+  on a miss it uses the head's MTP drafts for the next round. The windows are independent: `--spec-k` (n-gram) and `--spec-mtp-k` (MTP,
   default 2), both capped by the stages' `spec_k`; `--no-mtp` keeps n-gram only. The head loads the MTP
   block, a read-only embedding copy and a separate drafter cache, exports the target's final-norm hidden
   state on every forward, and returns the next round's drafts (`drafts` / `drafts_basis`). Measured on

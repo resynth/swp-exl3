@@ -219,6 +219,7 @@ def cmd_generate(a):
             n, d = st["spec_rounds"], max(st["spec_drafted"], 1)
             print(f"spec: {n} rounds, {st['spec_accepted']}/{st['spec_drafted']} drafts accepted "
                   f"({100.0 * st['spec_accepted'] / d:.1f}%), k={min(a.spec_k, p.spec_k)}, "
+                  f"match={a.spec_match}, "
                   f"mtp_k={min(a.spec_mtp_k, p.spec_k) if not a.no_mtp else 0}", file=sys.stderr)
             mix = []
             if st.get("spec_ngram_rounds"):
@@ -374,7 +375,7 @@ def cmd_smoke(a):
     return 0 if ok else 1
 
 
-def main(argv=None):
+def build_parser():
     ap = argparse.ArgumentParser(prog="swp-exl3")
     sp = ap.add_subparsers(dest="cmd", required=True)
 
@@ -401,10 +402,11 @@ def main(argv=None):
     s.add_argument("--max-new", type=int, default=128); s.add_argument("--temperature", type=float, default=0.0); s.add_argument("--top-p", type=float, default=1.0)
     s.add_argument("--seed", type=int); s.add_argument("--stop-id", action="append"); s.add_argument("--bench", action="store_true"); s.add_argument("--json")
     s.add_argument("--spec", action="store_true", help="speculative decode: prompt-lookup (n-gram) first, MTP fallback")
-    s.add_argument("--spec-k", type=int, default=3, help="n-gram drafts per verify round (capped by the stages' spec_k)")
+    s.add_argument("--spec-k", type=int, default=3, help="k: drafts per round; the verify window is k+1 rows (measured Kyojin ceiling: 7)")
     s.add_argument("--spec-mtp-k", type=int, default=2, help="MTP drafts per verify round when the n-gram lookup misses")
     s.add_argument("--no-mtp", action="store_true", help="exact n-gram drafting only; never ask the head stage for MTP drafts")
-    s.add_argument("--spec-match", type=int, default=2, help="preferred n-gram match length (a longer value falls back to 2)")
+    s.add_argument("--spec-match", type=int, default=4,
+                   help="n: minimum match length, strict. The last N tokens must already occur in the context (no 2-gram fallback)")
     s.set_defaults(fn=cmd_generate)
 
     s = sp.add_parser("smoke", help="<90 s correctness gate: ping, two greedy prompts, top-k logits, one bench"); pl(s)
@@ -430,6 +432,11 @@ def main(argv=None):
     s.add_argument("--ignore", action="append", default=[], help="field to ignore with --all (repeatable)")
     s.set_defaults(fn=cmd_config_check)
 
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
     a = ap.parse_args(argv)
     if a.cmd == "generate" and not (a.prompt or a.prompt_file or a.ids or a.ids_file):
         ap.error("generate needs --prompt, --prompt-file or --ids")

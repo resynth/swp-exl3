@@ -4,6 +4,7 @@ The invariant asserted here (and only here) is exactness: speculative greedy out
 non-speculative greedy output for every draft pattern, including when the stage must clear and replay
 because a lazy rewind is illegal."""
 import os, sys, unittest
+import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.test_pipeline import PROMPT, pipe
 from swp_exl3 import swp
@@ -118,10 +119,13 @@ class T(unittest.TestCase):
         self.assertEqual(st["spec_accepted"], st["spec_drafted"])
 
     def test_mtp_off_falls_back_to_ngram(self):
+        # No MTP drafter on the head: the 2-gram opt-in must still drive an n-gram round and stay exact.
         p, _ = pipe([4])
         self.assertFalse(p.head_mtp)
-        got, st = p.generate(PROMPT, max_new=10, spec=SpecConfig(k=3))
+        got, st = p.generate(PROMPT, max_new=10, spec=SpecConfig(k=3, match=2))
         self.assertEqual(got, reference([4], PROMPT, 10))
+        self.assertGreater(st["spec_ngram_rounds"], 0)
+        self.assertEqual(st["spec_mtp_rounds"], 0)
 
     def test_mtp_fallback_uses_mtp_k_when_ngram_k_is_larger(self):
         # The two windows are independent: an n-gram window of 3 must not make the MTP fallback ask for 3.
@@ -248,6 +252,66 @@ class T(unittest.TestCase):
         self.assertEqual(ngram_drafts([1, 2, 3, 4, 1, 2, 3], 2, 3), [4, 1])
         self.assertEqual(ngram_drafts([1, 2, 3], 2, 2), [])
         self.assertEqual(ngram_drafts([1, 2, 3, 4], 3, 3), [])
+
+    def test_match_is_a_strict_floor(self):
+        self.assertEqual(SpecConfig().match, 4)          # validated default floor
+        # The last 2 tokens occurred at 0..1, but the last 3 did not: no implicit 2-gram fallback.
+        ctx = [1, 2, 3, 4, 1, 2]
+        self.assertEqual(SpecConfig(k=2, match=3).propose(ctx, 2), [])
+        self.assertEqual(SpecConfig(k=2, match=4).propose(ctx, 2), [])
+        self.assertEqual(SpecConfig(k=2, match=0).propose(ctx, 2), [])
+        self.assertEqual(SpecConfig(k=2, match=-1).propose(ctx, 2), [])
+        self.assertEqual(SpecConfig(k=2, match=99).propose(ctx, 2), [])
+        # match=2 is the aggressive opt-in and restores the old behaviour.
+        self.assertEqual(SpecConfig(k=2, match=2).propose(ctx, 2), [3, 4])
+
+    def test_repeated_trigram_returns_the_following_tokens(self):
+        ctx = [5, 6, 7, 8, 9, 5, 6, 7]
+        self.assertEqual(SpecConfig(k=2, match=3).propose(ctx, 2), [8, 9])
+        self.assertEqual(SpecConfig(k=3, match=3).propose(ctx, 3), [8, 9, 5])
+
+    def test_proposals_always_match_at_least_the_floor(self):
+        # The invariant the strict floor rests on: every non-empty proposal is backed by an occurrence of
+        # the full `match`-token suffix (re-scanned here, independently of ngram_drafts).
+        rng = np.random.default_rng(1234)
+        for _ in range(200):
+            ctx = [int(x) for x in rng.integers(0, 8, size=int(rng.integers(1, 30)))]
+            for n in range(1, 7):
+                d = SpecConfig(k=3, match=n).propose(ctx, 3)
+                if not d:
+                    continue
+                key = tuple(ctx[-n:])
+                hits = [i for i in range(len(ctx) - n - 1, -1, -1) if tuple(ctx[i:i + n]) == key]
+                self.assertTrue(hits, (ctx, n, d))
+                self.assertEqual(d, [int(x) for x in ctx[hits[0] + n:hits[0] + n + 3]], (ctx, n))
+
+    def test_two_gram_only_context_uses_mtp_instead(self):
+        # Chosen so the early rounds revisit a bigram but never a trigram (the match=2 run proves the
+        # bigram hit is real). The strict floors must leave the draft to MTP instead of taking the weak hit.
+        prompt = [57, 51, 39, 27, 32, 16, 31, 23, 15, 62, 0]
+        ref = reference([4], prompt, 12)
+
+        def plan(pos, k):
+            i = pos - len(prompt)
+            return ref[i:i + k] if 0 <= i < len(ref) else []
+
+        def run(**kw):
+            p, _ = pipe([4], mtp_plan=plan)
+            got, st = p.generate(prompt, max_new=12, spec=SpecConfig(k=3, mtp_k=2, **kw))
+            self.assertEqual(got, ref)
+            return st
+
+        self.assertGreater(run(match=2)["spec_ngram_rounds"], 0)
+        for kw in ({"match": 3}, {}):                    # {} exercises the default floor (4)
+            st = run(**kw)
+            self.assertEqual(st["spec_ngram_rounds"], 0, kw)
+            self.assertEqual(st["spec_lookup_hits"], 0, kw)
+            self.assertGreater(st["spec_mtp_rounds"], 0, kw)
+
+    def test_drafter_override_bypasses_the_floor(self):
+        ctx = [1, 2, 3, 4, 1, 2]
+        d = SpecConfig(k=2, match=99, drafter=lambda c, k: [7, 8]).propose(ctx, 2)
+        self.assertEqual(d, [7, 8])
 
     def test_cli_spec_generate(self):
         import tempfile

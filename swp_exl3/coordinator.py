@@ -29,10 +29,13 @@ def ngram_drafts(tokens, k, n=2):
 class SpecConfig:
     """Drafting policy for `Pipeline.generate(spec=...)`. `drafter(context, k)` overrides the n-gram lookup.
 
-    n-gram (prompt lookup) is tried first with `k`; when it misses and `use_mtp` is true, the head stage's
-    MTP drafter fills the gap with at most `mtp_k` drafts (a separate, usually smaller window)."""
+    n-gram (prompt lookup) is tried first with `k` and a strict minimum match length `match`: the last
+    `match` tokens must already occur earlier in the context, or the lookup misses. There is no shorter
+    fallback; `match=2` restores the old aggressive 2-gram behaviour and a very large `match` disables
+    n-gram drafting (MTP/plain only). When the n-gram lookup misses and `use_mtp` is true, the head
+    stage's MTP drafter fills the gap with at most `mtp_k` drafts (a separate, usually smaller window)."""
     k: int = 3
-    match: int = 2
+    match: int = 4
     mtp_k: int = 2
     use_mtp: bool = True
     accept: str = "argmax"                 # "argmax" (greedy) or "sample" (T>0: sample target, accept on equality)
@@ -40,15 +43,15 @@ class SpecConfig:
     seed: int = None
 
     def propose(self, context, k):
+        """Drafts for the next round. `match` is a strict minimum: no shorter n-gram fallback."""
         if k <= 0:
             return []
         if self.drafter is not None:
             return [int(x) for x in (self.drafter(list(context), k) or [])][:k]
-        for n in ((self.match, 2) if self.match != 2 else (2,)):
-            d = ngram_drafts(context, k, n)
-            if d:
-                return d
-        return []
+        n = int(self.match)
+        if n < 1:
+            return []
+        return ngram_drafts(context, k, n)
 
 
 NEAR_TIE_LOGITS = 0.1

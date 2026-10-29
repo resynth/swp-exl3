@@ -996,16 +996,106 @@ Pure 8192-token prefill (`--max-new 1`): **433.3 tok/s novel**, **478.7 tok/s re
   were good (34/50). This is the 2-gram precision problem, not MTP.
 * A diagnostic probe using `SpecConfig` with only 3-gram or 4-gram lookup reached **18.14** and **20.06**
   tok/s on the same 8k novel prompt, with 48/47 MTP rounds. `--spec-match 3`/`4` did not reproduce that
-  because `SpecConfig.propose` currently falls back to a 2-gram match. The strict-match fix is planned
-  next (make the match length a floor and default it to 3).
+  because `SpecConfig.propose` still fell back to a 2-gram match. The strict floor now removes that
+  fallback and defaults to 4; see "Strict n-gram match floor" below for the CLI reproduction.
 * `smoke` **PASS**: golden prompts identical; spec check 0 non-near-tie flips, 1 near-tie (budget 2),
   max KL 1.95e-3. Novel `--spec` output differs from plain (MTP is not exact). `--no-mtp` also diverged
   from plain on the short novel prompt at a batched-verify near-tie; n-gram exactness is not guaranteed
   on novel prose, though every repetitive run was identical.
 
-**Open validation.** The agent-trace mix (10–20 real requests, n-gram `--spec-k 3/7/8`), the strict
-n-gram floor, and the decision to enable `--spec` by default in `swp-kyojin-server` are still pending.
-This section records the policy and the first end-to-end numbers.
+**Open validation.** The agent-trace mix (10–20 real requests, n-gram `--spec-k 3/7/8`) and the decision to
+enable `--spec` by default in `swp-kyojin-server` are still pending. The strict n-gram floor is now
+implemented and measured in the next section.
+
+## Strict n-gram match floor (Phase 1)
+
+**Decision.** `--spec-match` / `SpecConfig.match` is a **strict minimum match length**: `propose` calls
+`ngram_drafts(context, k, match)` only, and returns no drafts when the last `match` tokens have no earlier
+occurrence. The implicit 2-gram fallback is gone. The default floor is **4**, chosen by the rule below;
+`--spec-match 2` is the aggressive opt-in and a very large value (`--spec-match 99`) is MTP-only. `k`
+(`--spec-k`, verify window `k+1` rows) is unchanged and separate from `n` (match length); the coordinator
+still clamps `k` to the stages' advertised `spec_k` and does not hardcode a Kyojin ceiling.
+
+**Why.** On long novel prose, 2-gram matches are everywhere but rarely predict the continuation, and any
+hit suppresses MTP (the 8k prose row was 40 n-gram rounds for 8/120 accepted and 14.29 tok/s vs 14.58
+plain). With the old code, `--spec-match 3`/`4` still ran the 2-gram lookup first, so the CLI could not
+reproduce the 18.14/20.06 tok/s probe. The strict floor makes the flag mean what it says.
+
+**Method.** Real pair: Razer `[0,7)` + Strix `[7,45)`, f32, chunk 2048, both caches 8192, head stage
+`mtp = true`, `mtp_cache_tokens = 8192`, `k = 3`, `--spec-mtp-k 2`, greedy, 128 new tokens, warm stages.
+Prompts are built from this project by `/tmp/kilo/make_prompts.py`, not fiction: the 149-token prose
+prompt from `SMOKE_BENCH_PROMPT` (reproduces the old short-novel baseline), short code (267 tokens
+from the speculative loop in `coordinator.py`), short plan (314 tokens from this plan), short repetitive
+code (155 tokens of `def step_i` lines), 8k code (8000 tokens of distinct project source), 8k plan
+(8000 tokens of `.kilo/plans/` + `README`/`RESULTS`/`BRINGUP`/`MEASUREMENTS`), 8k repetitive test code
+(8000 tokens where only the literals change). Plain TG is 14.4–14.9 tok/s on every prompt, within the
+old prose baselines (14.53–15.09), so the pair had not drifted. Every run below uses the CLI
+(`--spec --spec-match N`), reproducing the earlier custom-drafter probe.
+
+| prompt | plain | strict 3 | strict 4 | MTP-only (99) |
+|---|---|---|---|---|
+| prose, 149 tok (`SMOKE_BENCH_PROMPT`) | 14.88 | 19.23 | 19.66 | **22.13** |
+| short code, 267 tok | 14.75 | 21.95 | 21.57 | **24.85** |
+| short plan, 314 tok | 14.76 | 19.43 | 20.61 | **20.88** |
+| short repetitive, 155 tok | 14.74 | 21.82 | 21.80 | — |
+| 8k code, 8000+128 | 14.43 | 18.62 | 22.55 | **23.89** |
+| 8k plan, 8000+128 | 14.47 | 27.18 | **27.77** | 24.87 |
+| 8k repetitive, 8000+128 | 14.43 | 23.41 | **26.87** | — |
+| 8k code + cache-edge, 8064+128 | — | 19.44 | — | — |
+
+The 149-token prose prompt also shows the strict floor working as intended: 61 MTP rounds and one
+n-gram round (2/3 accepted), versus the old fallback's 4 n-gram rounds / 7 of 12 accepted and 19.71
+tok/s. MTP-only is faster still here (22.13), so on that prompt the n-gram path is not earning its
+rounds, but it costs only 11% versus MTP-only and is 32% above plain.
+
+Mix at 8k (rounds, accepted/drafted by source):
+
+| prompt | policy | rounds | n-gram | MTP | plain | lookup hits |
+|---|---|---|---|---|---|---|
+| code | strict 3 | 65 | 25r 23/75 | 22r 41/44 | 18 | 25 |
+| code | strict 4 | 53 | 10r 11/30 | 34r 64/68 | 9 | 10 |
+| code | MTP-only | 46 | — | 45r 82/90 | 1 | 0 |
+| plan | strict 3 | 42 | 38r 82/114 | 2r 4/4 | 2 | 38 |
+| plan | strict 4 | 41 | 34r 79/102 | 4r 8/8 | 3 | 34 |
+| plan | MTP-only | 44 | — | 43r 84/86 | 1 | 0 |
+| repetitive | strict 3 | 51 | 39r 65/117 | 6r 12/12 | 6 | 39 |
+| repetitive | strict 4 | 45 | 33r 71/99 | 6r 12/12 | 6 | 33 |
+
+**Break-even.** The earlier prose probe put an MTP k=2 round at ~95 ms for ~1.36 accepted drafts/round
+(2.36 tokens including the bonus), so an n-gram k=3 round (B=4, ~95.9 ms) needed about the same rate to
+pay for itself. On this pair MTP is stronger: 82/90 = 1.82 accepted/round on 8k code and 84/86 = 1.95 on
+8k plan. Strict 3 still spent 25 code rounds on 23/75 = 0.31 accepted/round, below break-even; strict 4
+cut those to 10 rounds (11/30 = 0.37) and gave MTP 12 more rounds, hence 18.62 -> 22.55 tok/s. On plan
+text n-grams carry their weight (34r, 79/102 = 0.77), so both floors beat MTP-only. No fixed 1.2 is
+hardcoded: the floor is chosen from measured tokens/ms by source, as here.
+
+**Floor rule.** Best 8k "novel" (project) TG with no more than 3% loss on the repetitive prompts versus
+the other floor. Strict 4 wins 8k code (+21%) and 8k plan (+2%) and wins or ties both repetitive prompts
+(short 21.80 vs 21.82, 8k 26.87 vs 23.41); its only loss is short code, 21.57 vs 21.95 (-1.7%, inside
+the 3% budget). **The default is therefore 4.** `--spec-match 3` remains useful for plan/prose-like text
+where 3-grams are reliable, and `2` is the aggressive opt-in.
+
+**MTP-only beats both floors on prose and code.** On the 149-token prose prompt (22.13 vs 19.66), 8k
+code (23.89 vs 22.55) and short code (24.85 vs 21.57), disabling n-gram (`--spec-match 99`) beats strict
+4, while on plan text it loses (24.87 vs 27.77) and on repetitive code it loses badly. That is the
+expected shape: n-gram only earns its place when its accepted-drafts/round clears the measured MTP rate,
+which code at k=3 does not. Reported rather than hidden; a future adaptive policy (Phase 2) is the way
+to pick per-round, not a lower fixed floor. The default stays 4 because it is the best n-gram floor and
+still wins clearly on repeated/plan-like text, which is the workload n-gram is for.
+
+**Exactness and regression.** Repetitive output at 155 and 8000 tokens is **byte-identical** to plain
+with strict 4 (diffed stdout). Novel/project code and plan text can differ from plain on a batched-verify
+near-tie, and MTP output is not guaranteed exact; `--no-mtp` remains the n-gram-only escape hatch. The
+previous failure case, 8064 prompt + 128 new with cache 8192, completes under strict 3 (127 new tokens,
+19.44 tok/s, 63 rounds, no `context_exceeded`); the draft clamp is still in force. `smoke` **PASS** on
+the same stages: golden prompts identical, 20 verify rows with 0 non-near-tie flips, 1 near-tie (budget
+2), max KL 1.95e-3. Local suite: 64 tests OK (1 skipped). Kyojin HTTP suite: 17 tests OK.
+
+**Kyojin k ceiling (measured earlier, still current).** B=9 (k=8) crosses the engine's 8-row caps:
+verify is 231.7 ms vs 156.1 ms at B=8. Use `--spec-k 7` for repetitive n-gram work; the default stays 3.
+This is a deployment measurement, not a coordinator invariant: the backend/config `spec_k` remains the
+authority and the coordinator only clamps to it.
+
 
 ## Verify-row flag sweep re-run (marker ON) — the "nothing helps" T6 result is void, and one flag *was* hidden
 

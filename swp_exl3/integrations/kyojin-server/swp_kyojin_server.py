@@ -322,7 +322,8 @@ class PipelineEngine:
                                "rollback": st.get("rollback"),
                                "reused_prefix": reused, "new_tokens": len(gen_ids),
                                "time_prefill": first - t0, "time_generate": max(end - first, 0.0),
-                               "accepted_draft_tokens": accepted, "rejected_draft_tokens": rejected}
+                               "accepted_draft_tokens": accepted, "rejected_draft_tokens": rejected,
+                               "spec_match": int(getattr(self.spec, "match", 0) or 0)}
             for key in ("spec_rounds", "spec_drafted", "spec_accepted", "spec_mtp_drafts",
                         "spec_ngram_rounds", "spec_ngram_drafted", "spec_ngram_accepted",
                         "spec_mtp_rounds", "spec_mtp_drafted", "spec_mtp_accepted",
@@ -368,10 +369,11 @@ def build_parser():
     ap.add_argument("--chat-template", default=None, help="jinja file (default: Kyojin's GLM-5.3 template, else <model>/chat_template.jinja)")
     ap.add_argument("--stop-id", action="append", default=[], help="extra stop token id (repeatable)")
     ap.add_argument("--spec", action="store_true", help="speculative decoding: prompt-lookup (n-gram) first, MTP fallback")
-    ap.add_argument("--spec-k", type=int, default=3, help="n-gram drafts per verify round (capped by the stages' spec_k)")
+    ap.add_argument("--spec-k", type=int, default=3, help="k: drafts per round; the verify window is k+1 rows (measured Kyojin ceiling: 7)")
     ap.add_argument("--spec-mtp-k", type=int, default=2, help="MTP drafts per verify round when the n-gram lookup misses")
     ap.add_argument("--no-mtp", action="store_true", help="exact n-gram drafting only; never ask the head stage for MTP drafts")
-    ap.add_argument("--spec-match", type=int, default=2, help="preferred n-gram match length (a longer value falls back to 2)")
+    ap.add_argument("--spec-match", type=int, default=4,
+                    help="n: minimum match length, strict. The last N tokens must already occur in the context (no 2-gram fallback)")
     ap.add_argument("--spec-log", default=None,
                     help="append one JSON object per request (stats + timestamp + id); rotates at 64 MiB, 2 backups")
     return ap
@@ -407,7 +409,7 @@ def main(argv=None):
     tpl = Path(args.chat_template).expanduser() if args.chat_template else Path(kserve.DEFAULT_TEMPLATE)
     if not tpl.exists():
         tpl = Path(args.model_dir) / "chat_template.jinja"
-    spec = SpecConfig(k=max(0, args.spec_k), match=max(1, args.spec_match),
+    spec = SpecConfig(k=max(0, args.spec_k), match=args.spec_match,
                       mtp_k=max(0, args.spec_mtp_k), use_mtp=not args.no_mtp) if args.spec else None
     engine = PipelineEngine(pipe, tok, args.ctx, eos, spec=spec, spec_log=args.spec_log,
                             log=lambda m: print(m, flush=True))
